@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <a href="hypertree.exe?raw=true">
+  <a href="https://github.com/ddccdcdc/HyperTree/releases/latest/download/hypertree.exe">
     <img src="https://img.shields.io/badge/Download-hypertree.exe%20(Windows%20x64)-10B981?style=for-the-badge&logo=windows&logoColor=white" alt="Download hypertree.exe" />
   </a>
 </p>
