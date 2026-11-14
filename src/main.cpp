@@ -141,10 +141,118 @@ struct AppState {
 
 AppState g_app;
 
+// Dynamic uxtheme.dll dark mode helpers (Windows 10 1903+ / Windows 11)
+namespace DarkThemeApi {
+    enum PreferredAppMode { Default = 0, AllowDark = 1, ForceDark = 2, ForceLight = 3 };
+    using FnSetPreferredAppMode = int(WINAPI*)(PreferredAppMode);
+    using FnAllowDarkModeForWindow = BOOL(WINAPI*)(HWND, BOOL);
+    using FnRefreshImmersiveColorPolicyState = void(WINAPI*)();
+    using FnFlushMenuThemes = void(WINAPI*)();
+
+    struct Api {
+        FnSetPreferredAppMode setAppMode = nullptr;
+        FnAllowDarkModeForWindow allowWnd = nullptr;
+        FnRefreshImmersiveColorPolicyState refreshPolicy = nullptr;
+        FnFlushMenuThemes flushMenus = nullptr;
+        Api() {
+            HMODULE h = LoadLibraryW(L"uxtheme.dll");
+            if (!h) return;
+            setAppMode = reinterpret_cast<FnSetPreferredAppMode>(GetProcAddress(h, MAKEINTRESOURCEA(135)));
+            allowWnd = reinterpret_cast<FnAllowDarkModeForWindow>(GetProcAddress(h, MAKEINTRESOURCEA(133)));
+            refreshPolicy = reinterpret_cast<FnRefreshImmersiveColorPolicyState>(GetProcAddress(h, MAKEINTRESOURCEA(104)));
+            flushMenus = reinterpret_cast<FnFlushMenuThemes>(GetProcAddress(h, MAKEINTRESOURCEA(136)));
+        }
+    };
+
+    inline Api& Get() {
+        static Api api;
+        return api;
+    }
+
+    inline void SetAppDark(bool dark) {
+        auto& a = Get();
+        if (a.setAppMode) a.setAppMode(dark ? ForceDark : ForceLight);
+        if (a.refreshPolicy) a.refreshPolicy();
+        if (a.flushMenus) a.flushMenus();
+    }
+
+    inline void AllowWindow(HWND h, bool dark) {
+        auto& a = Get();
+        if (h && a.allowWnd) a.allowWnd(h, dark ? TRUE : FALSE);
+    }
+}
+
+LRESULT CALLBACK TabCtrlSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_ERASEBKGND) {
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        FillRect(reinterpret_cast<HDC>(wp), &rc, g_app.bgBrush);
+        return 1;
+    }
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps{};
+        HDC hdc = BeginPaint(hwnd, &ps);
+        RECT rc{};
+        GetClientRect(hwnd, &rc);
+        FillRect(hdc, &rc, g_app.bgBrush);
+
+        int count = TabCtrl_GetItemCount(hwnd);
+        int cur = TabCtrl_GetCurSel(hwnd);
+        HFONT oldFont = static_cast<HFONT>(SelectObject(hdc, g_app.uiFont));
+        SetBkMode(hdc, TRANSPARENT);
+
+        for (int i = 0; i < count; ++i) {
+            RECT itemRc{};
+            TabCtrl_GetItemRect(hwnd, i, &itemRc);
+            bool sel = (i == cur);
+            COLORREF tabBg = sel
+                ? (g_app.darkMode ? RGB(44, 47, 56) : RGB(255, 255, 255))
+                : (g_app.darkMode ? RGB(32, 34, 40) : RGB(232, 235, 240));
+            COLORREF tabFg = sel
+                ? (g_app.darkMode ? RGB(245, 247, 250) : RGB(18, 20, 24))
+                : (g_app.darkMode ? RGB(175, 180, 192) : RGB(75, 80, 90));
+
+            HBRUSH br = CreateSolidBrush(tabBg);
+            FillRect(hdc, &itemRc, br);
+            DeleteObject(br);
+
+            if (sel) {
+                RECT accent{ itemRc.left, itemRc.bottom - 2, itemRc.right, itemRc.bottom };
+                HBRUSH accBr = CreateSolidBrush(RGB(56, 152, 236));
+                FillRect(hdc, &accent, accBr);
+                DeleteObject(accBr);
+            }
+
+            wchar_t text[128]{};
+            TCITEMW ti{};
+            ti.mask = TCIF_TEXT;
+            ti.pszText = text;
+            ti.cchTextMax = 128;
+            TabCtrl_GetItem(hwnd, i, &ti);
+            SetTextColor(hdc, tabFg);
+            DrawTextW(hdc, text, -1, &itemRc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        }
+
+        HPEN sepPen = CreatePen(PS_SOLID, 1, g_app.darkMode ? RGB(52, 55, 64) : RGB(210, 214, 222));
+        HGDIOBJ oldPen = SelectObject(hdc, sepPen);
+        MoveToEx(hdc, rc.left, rc.bottom - 1, nullptr);
+        LineTo(hdc, rc.right, rc.bottom - 1);
+        SelectObject(hdc, oldPen);
+        DeleteObject(sepPen);
+
+        SelectObject(hdc, oldFont);
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefSubclassProc(hwnd, msg, wp, lp);
+}
+
 void ApplyTheme() {
     const auto& L = GetLangStrings(g_app.lang);
+    DarkThemeApi::SetAppDark(g_app.darkMode);
     BOOL dark = g_app.darkMode ? TRUE : FALSE;
     DwmSetWindowAttribute(g_app.hwnd, 20 /*DWMWA_USE_IMMERSIVE_DARK_MODE*/, &dark, sizeof(dark));
+    DarkThemeApi::AllowWindow(g_app.hwnd, g_app.darkMode);
 
     if (g_app.bgBrush) DeleteObject(g_app.bgBrush);
     if (g_app.editBrush) DeleteObject(g_app.editBrush);
@@ -157,19 +265,39 @@ void ApplyTheme() {
 
     for (HWND lv : { g_app.listTree, g_app.listFiles, g_app.listTypes }) {
         if (lv) {
+            DarkThemeApi::AllowWindow(lv, g_app.darkMode);
             SetWindowTheme(lv, g_app.darkMode ? L"DarkMode_Explorer" : L"Explorer", nullptr);
             ListView_SetBkColor(lv, listBg);
             ListView_SetTextBkColor(lv, listBg);
             ListView_SetTextColor(lv, fg);
             HWND hdr = ListView_GetHeader(lv);
-            if (hdr) SetWindowTheme(hdr, g_app.darkMode ? L"DarkMode_ItemsView" : L"ItemsView", nullptr);
+            if (hdr) {
+                DarkThemeApi::AllowWindow(hdr, g_app.darkMode);
+                SetWindowTheme(hdr, g_app.darkMode ? L"DarkMode_ItemsView" : L"ItemsView", nullptr);
+            }
         }
     }
-    for (HWND c : { g_app.driveCombo, g_app.minSizeCombo, g_app.editSearch, g_app.btnFolder,
-                    g_app.btnScan, g_app.btnElevate, g_app.btnExport, g_app.btnLang,
-                    g_app.btnTheme, g_app.btnClear, g_app.btnTmUp, g_app.btnTmRoot,
-                    g_app.chkTreemap, g_app.chkSystem }) {
-        if (c) SetWindowTheme(c, g_app.darkMode ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+    for (HWND cmb : { g_app.driveCombo, g_app.minSizeCombo }) {
+        if (cmb) {
+            DarkThemeApi::AllowWindow(cmb, g_app.darkMode);
+            SetWindowTheme(cmb, g_app.darkMode ? L"DarkMode_CFD" : L"CFD", nullptr);
+            COMBOBOXINFO cbi{ sizeof(cbi) };
+            if (GetComboBoxInfo(cmb, &cbi)) {
+                DarkThemeApi::AllowWindow(cbi.hwndList, g_app.darkMode);
+                SetWindowTheme(cbi.hwndList, g_app.darkMode ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+                DarkThemeApi::AllowWindow(cbi.hwndItem, g_app.darkMode);
+                SetWindowTheme(cbi.hwndItem, g_app.darkMode ? L"DarkMode_CFD" : L"CFD", nullptr);
+            }
+        }
+    }
+    for (HWND c : { g_app.editSearch, g_app.btnFolder, g_app.btnScan, g_app.btnElevate,
+                    g_app.btnExport, g_app.btnLang, g_app.btnTheme, g_app.btnClear,
+                    g_app.btnTmUp, g_app.btnTmRoot, g_app.chkTreemap, g_app.chkSystem,
+                    g_app.progressBar, g_app.statusLbl, g_app.tmLbl, g_app.tabCtrl }) {
+        if (c) {
+            DarkThemeApi::AllowWindow(c, g_app.darkMode);
+            SetWindowTheme(c, g_app.darkMode ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        }
     }
 
     g_app.treemap.SetDarkMode(g_app.darkMode);
@@ -254,9 +382,17 @@ void ApplyLanguage() {
     }) {
         SetWindowRtl(h, L.rtl);
     }
+    // Propagate WS_EX_LAYOUTRTL to each ListView's child SysHeader32 so header columns align with rows
+    for (HWND lv : { g_app.listTree, g_app.listFiles, g_app.listTypes }) {
+        if (!lv) continue;
+        HWND hdr = ListView_GetHeader(lv);
+        if (hdr) SetWindowRtl(hdr, L.rtl);
+        int w0 = ListView_GetColumnWidth(lv, 0);
+        if (w0 > 0) ListView_SetColumnWidth(lv, 0, w0);
+    }
     g_app.treemap.SetRtl(L.rtl);
     UpdateTreemapHeader();
-    InvalidateRect(g_app.hwnd, nullptr, TRUE);
+    RedrawWindow(g_app.hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
 }
 
 void PopulateDrives() {
@@ -265,7 +401,7 @@ void PopulateDrives() {
     for (const auto& d : g_app.drives) {
         std::wstring lbl = d.label.empty() ? d.type_label() : d.label;
         wchar_t line[256];
-        swprintf_s(line, L"%c:\\ [%s]  %s / %s (%s)",
+        swprintf_s(line, L"\u2066%c:\\\u2069 [%s]  \u2066%s / %s (%s)\u2069",
             d.letter, lbl.c_str(),
             FormatBytes(d.used_bytes()).c_str(),
             FormatBytes(d.total_bytes).c_str(),
@@ -593,6 +729,53 @@ void ShowNodeContextMenu(uint32_t nodeIdx, int screenX, int screenY) {
     }
 }
 
+LRESULT HandleCustomDrawHeader(HWND hdr, NMCUSTOMDRAW* cd) {
+    switch (cd->dwDrawStage) {
+        case CDDS_PREPAINT:
+            return CDRF_NOTIFYITEMDRAW;
+        case CDDS_ITEMPREPAINT: {
+            int idx = static_cast<int>(cd->dwItemSpec);
+            RECT rc = cd->rc;
+            COLORREF bg = g_app.darkMode ? RGB(36, 38, 45) : RGB(240, 242, 246);
+            COLORREF fg = g_app.darkMode ? RGB(225, 228, 236) : RGB(30, 32, 38);
+            COLORREF sep = g_app.darkMode ? RGB(58, 61, 72) : RGB(214, 218, 226);
+
+            HBRUSH hb = CreateSolidBrush(bg);
+            FillRect(cd->hdc, &rc, hb);
+            DeleteObject(hb);
+
+            HPEN pen = CreatePen(PS_SOLID, 1, sep);
+            HGDIOBJ oldPen = SelectObject(cd->hdc, pen);
+            MoveToEx(cd->hdc, rc.right - 1, rc.top + 4, nullptr);
+            LineTo(cd->hdc, rc.right - 1, rc.bottom - 4);
+            MoveToEx(cd->hdc, rc.left, rc.bottom - 1, nullptr);
+            LineTo(cd->hdc, rc.right, rc.bottom - 1);
+            SelectObject(cd->hdc, oldPen);
+            DeleteObject(pen);
+
+            wchar_t text[128]{};
+            HDITEMW hdi{};
+            hdi.mask = HDI_TEXT | HDI_FORMAT;
+            hdi.pszText = text;
+            hdi.cchTextMax = 128;
+            Header_GetItem(hdr, idx, &hdi);
+
+            UINT fmt = DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX;
+            if ((hdi.fmt & HDF_JUSTIFYMASK) == HDF_CENTER) fmt |= DT_CENTER;
+            else if ((hdi.fmt & HDF_JUSTIFYMASK) == HDF_RIGHT) fmt |= DT_RIGHT;
+            else fmt |= DT_LEFT;
+
+            RECT tr{ rc.left + 8, rc.top, rc.right - 8, rc.bottom };
+            SetBkMode(cd->hdc, TRANSPARENT);
+            SetTextColor(cd->hdc, fg);
+            SelectObject(cd->hdc, g_app.uiFont);
+            DrawTextW(cd->hdc, text, -1, &tr, fmt);
+            return CDRF_SKIPDEFAULT;
+        }
+    }
+    return CDRF_DODEFAULT;
+}
+
 LRESULT HandleCustomDrawTree(NMLVCUSTOMDRAW* cd) {
     switch (cd->nmcd.dwDrawStage) {
         case CDDS_PREPAINT:
@@ -754,6 +937,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.statusLbl = mk(L"STATIC", L"Select a drive or folder and click Scan.", SS_LEFT | SS_NOPREFIX, IDC_STATUS_LBL);
 
             g_app.tabCtrl = mk(WC_TABCONTROLW, L"", TCS_TABS, IDC_TABS);
+            SetWindowSubclass(g_app.tabCtrl, TabCtrlSubclassProc, 1, 0);
             auto addTab = [&](int idx, const wchar_t* text) {
                 TCITEMW ti{};
                 ti.mask = TCIF_TEXT;
@@ -796,7 +980,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         case WM_SIZE:
             LayoutControls();
             return 0;
-        case WM_CTLCOLORSTATIC:
+        case WM_CTLCOLORSTATIC: {
+            HDC hdc = reinterpret_cast<HDC>(wp);
+            SetBkColor(hdc, g_app.darkMode ? RGB(28, 29, 34) : RGB(244, 245, 248));
+            SetTextColor(hdc, g_app.darkMode ? RGB(230, 232, 238) : RGB(24, 25, 28));
+            return reinterpret_cast<LRESULT>(g_app.bgBrush);
+        }
         case WM_CTLCOLOREDIT:
         case WM_CTLCOLORLISTBOX: {
             HDC hdc = reinterpret_cast<HDC>(wp);
@@ -981,6 +1170,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         }
         case WM_NOTIFY: {
             auto* nm = reinterpret_cast<NMHDR*>(lp);
+            if (nm->code == NM_CUSTOMDRAW &&
+                (nm->hwndFrom == ListView_GetHeader(g_app.listTree) ||
+                 nm->hwndFrom == ListView_GetHeader(g_app.listFiles) ||
+                 nm->hwndFrom == ListView_GetHeader(g_app.listTypes))) {
+                return HandleCustomDrawHeader(nm->hwndFrom, reinterpret_cast<NMCUSTOMDRAW*>(lp));
+            }
             if (nm->hwndFrom == g_app.tabCtrl && nm->code == TCN_SELCHANGE) {
                 SwitchTab(TabCtrl_GetCurSel(g_app.tabCtrl));
                 return 0;
