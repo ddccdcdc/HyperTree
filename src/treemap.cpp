@@ -101,11 +101,12 @@ void LayoutNode(const DiskTree& tree, uint32_t dirIdx, D2D1_RECT_F rect, int dep
 
     std::vector<std::pair<uint32_t, uint64_t>> children;
     uint64_t totalSize = 0;
+    bool useAlloc = tree.nodes[dirIdx].allocated > 0;
     uint32_t c = tree.nodes[dirIdx].first_child;
     while (c != NONE_IDX) {
         const auto& cn = tree.nodes[c];
         if (!hideSystem || (cn.flags & FLAG_IS_SYSTEM) == 0) {
-            uint64_t sz = cn.size;
+            uint64_t sz = useAlloc ? cn.allocated : cn.size;
             if (sz > 0) {
                 children.emplace_back(c, sz);
                 totalSize += sz;
@@ -197,9 +198,6 @@ bool TreemapControl::Create(HWND parent, HINSTANCE hInst, int x, int y, int w, i
 void TreemapControl::Resize(int x, int y, int w, int h) {
     if (!hwnd) return;
     MoveWindow(hwnd, x, y, w, h, TRUE);
-    if (rt && w > 0 && h > 0) {
-        rt->Resize(D2D1::SizeU(static_cast<UINT32>(w), static_cast<UINT32>(h)));
-    }
     layout_dirty = true;
     InvalidateRect(hwnd, nullptr, FALSE);
 }
@@ -257,13 +255,10 @@ void TreemapControl::Cleanup() {
 
 void TreemapControl::EnsureResources() {
     if (rt || !d2d_factory || !hwnd) return;
-    RECT rc{};
-    GetClientRect(hwnd, &rc);
-    D2D1_SIZE_U size = D2D1::SizeU(std::max<LONG>(1, rc.right - rc.left), std::max<LONG>(1, rc.bottom - rc.top));
-    HRESULT hr = d2d_factory->CreateHwndRenderTarget(
-        D2D1::RenderTargetProperties(),
-        D2D1::HwndRenderTargetProperties(hwnd, size),
-        &rt);
+    D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
+        D2D1_RENDER_TARGET_TYPE_DEFAULT,
+        D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+    HRESULT hr = d2d_factory->CreateDCRenderTarget(&props, &rt);
     if (SUCCEEDED(hr) && rt) {
         rt->CreateSolidColorBrush(D2D1::ColorF(D2D1::ColorF::White), &brush);
     }
@@ -336,10 +331,15 @@ void TreemapControl::UpdateTooltip(int px, int py) {
     SendMessageW(tooltip_hwnd, TTM_UPDATETIPTEXTW, 0, reinterpret_cast<LPARAM>(&ti));
 }
 
-void TreemapControl::Render() {
+void TreemapControl::Render(HDC hdc) {
+    if (!hdc) return;
     EnsureResources();
     if (!rt || !brush) return;
     if (layout_dirty) RebuildLayout();
+
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    if (FAILED(rt->BindDC(hdc, &rc))) return;
 
     rt->BeginDraw();
     rt->Clear(dark_mode
@@ -390,9 +390,14 @@ LRESULT CALLBACK TreemapControl::WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     switch (msg) {
         case WM_PAINT: {
             PAINTSTRUCT ps{};
-            BeginPaint(hwnd, &ps);
-            self->Render();
+            HDC hdc = BeginPaint(hwnd, &ps);
+            self->Render(hdc);
             EndPaint(hwnd, &ps);
+            return 0;
+        }
+        case WM_PRINT:
+        case WM_PRINTCLIENT: {
+            self->Render(reinterpret_cast<HDC>(wp));
             return 0;
         }
         case WM_ERASEBKGND:

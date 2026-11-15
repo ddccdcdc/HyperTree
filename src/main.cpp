@@ -401,7 +401,7 @@ void PopulateDrives() {
     for (const auto& d : g_app.drives) {
         std::wstring lbl = d.label.empty() ? d.type_label() : d.label;
         wchar_t line[256];
-        swprintf_s(line, L"\u2066%c:\\\u2069 [%s]  \u2066%s / %s (%s)\u2069",
+        swprintf_s(line, L"%c:\\ [%s]  %s / %s (%s)",
             d.letter, lbl.c_str(),
             FormatBytes(d.used_bytes()).c_str(),
             FormatBytes(d.total_bytes).c_str(),
@@ -820,7 +820,7 @@ LRESULT HandleCustomDrawTree(NMLVCUSTOMDRAW* cd) {
                     DrawTextW(cd->nmcd.hdc, ch, 3, &cr, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
                 }
                 x += 22;
-                uint32_t col = node.is_dir() ? 0xEBB441 : g_app.tree->node_color(row.node_idx);
+                uint32_t col = node.is_dir() ? 0xEBB441 : (node.is_cloud() ? 0x3898EC : g_app.tree->node_color(row.node_idx));
                 HBRUSH dotBr = CreateSolidBrush(RGB((col >> 16) & 0xFF, (col >> 8) & 0xFF, col & 0xFF));
                 HGDIOBJ oldBr = SelectObject(cd->nmcd.hdc, dotBr);
                 HPEN nullPen = static_cast<HPEN>(GetStockObject(NULL_PEN));
@@ -837,10 +837,16 @@ LRESULT HandleCustomDrawTree(NMLVCUSTOMDRAW* cd) {
                     DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
                 return CDRF_SKIPDEFAULT;
             } else if (cd->iSubItem == 1) {
-                uint64_t pSize = (node.parent != NONE_IDX)
-                    ? std::max<uint64_t>(1, g_app.tree->nodes[node.parent].size)
-                    : std::max<uint64_t>(1, node.size);
-                double pct = std::min(1.0, static_cast<double>(node.size) / static_cast<double>(pSize));
+                uint64_t pAlloc = (node.parent != NONE_IDX) ? g_app.tree->nodes[node.parent].allocated : node.allocated;
+                double pct = 0.0;
+                if (pAlloc > 0) {
+                    pct = std::min(1.0, static_cast<double>(node.allocated) / static_cast<double>(pAlloc));
+                } else {
+                    uint64_t pSize = (node.parent != NONE_IDX)
+                        ? std::max<uint64_t>(1, g_app.tree->nodes[node.parent].size)
+                        : std::max<uint64_t>(1, node.size);
+                    pct = std::min(1.0, static_cast<double>(node.size) / static_cast<double>(pSize));
+                }
                 RECT barRc{ rc.left + 6, rc.top + 4, rc.right - 6, rc.bottom - 4 };
                 HBRUSH trackBr = CreateSolidBrush(g_app.darkMode ? RGB(52, 54, 62) : RGB(220, 224, 230));
                 FillRect(cd->nmcd.hdc, &barRc, trackBr);
@@ -952,6 +958,18 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.listTree  = mk(WC_LISTVIEWW, L"", lvStyle, IDC_LIST_TREE);
             g_app.listFiles = mk(WC_LISTVIEWW, L"", lvStyle, IDC_LIST_FILES);
             g_app.listTypes = mk(WC_LISTVIEWW, L"", lvStyle, IDC_LIST_TYPES);
+            auto lvSub = [](HWND h, UINT m, WPARAM w, LPARAM l, UINT_PTR, DWORD_PTR) -> LRESULT {
+                if (m == WM_NOTIFY) {
+                    auto* nm = reinterpret_cast<NMHDR*>(l);
+                    if (nm->code == NM_CUSTOMDRAW && nm->hwndFrom == ListView_GetHeader(h)) {
+                        return HandleCustomDrawHeader(nm->hwndFrom, reinterpret_cast<NMCUSTOMDRAW*>(l));
+                    }
+                }
+                return DefSubclassProc(h, m, w, l);
+            };
+            SetWindowSubclass(g_app.listTree, lvSub, 1, 0);
+            SetWindowSubclass(g_app.listFiles, lvSub, 1, 0);
+            SetWindowSubclass(g_app.listTypes, lvSub, 1, 0);
 
             g_app.editSearch   = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_EDIT_SEARCH), g_app.hInst, nullptr);
@@ -1445,9 +1463,20 @@ LangId ShowLanguagePickerDialog(HINSTANCE hInst) {
     return st.chosen;
 }
 
-int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
+int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR cmdLine, int nCmdShow) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+
+    if (cmdLine && cmdLine[0]) {
+        std::wstring arg(cmdLine);
+        while (!arg.empty() && (arg.front() == L' ' || arg.front() == L'"')) arg.erase(arg.begin());
+        while (!arg.empty() && (arg.back() == L' ' || arg.back() == L'"')) arg.pop_back();
+        DWORD attr = GetFileAttributesW(arg.c_str());
+        if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) {
+            g_app.useCustomFolder = true;
+            g_app.customFolder = arg;
+        }
+    }
 
     INITCOMMONCONTROLSEX icc{ sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_TAB_CLASSES | ICC_PROGRESS_CLASS };
     InitCommonControlsEx(&icc);

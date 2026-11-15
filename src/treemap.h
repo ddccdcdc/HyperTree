@@ -40,7 +40,7 @@ private:
     std::vector<TreemapTile> tiles;
 
     ID2D1Factory* d2d_factory = nullptr;
-    ID2D1HwndRenderTarget* rt = nullptr;
+    ID2D1DCRenderTarget* rt = nullptr;
     ID2D1SolidColorBrush* brush = nullptr;
     IDWriteFactory* dw_factory = nullptr;
     IDWriteTextFormat* text_fmt = nullptr;
@@ -50,7 +50,7 @@ private:
     void EnsureResources();
     void DiscardResources();
     void RebuildLayout();
-    void Render();
+    void Render(HDC hdc);
     void UpdateTooltip(int px, int py);
 
     static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);

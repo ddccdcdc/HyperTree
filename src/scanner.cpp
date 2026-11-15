@@ -12,6 +12,19 @@ namespace {
 constexpr uint64_t NTFS_ROOT_FRN = 5;
 constexpr size_t   MFT_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MB sequential reads
 
+#ifndef FILE_ATTRIBUTE_RECALL_ON_OPEN
+#define FILE_ATTRIBUTE_RECALL_ON_OPEN 0x00040000
+#endif
+#ifndef FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS
+#define FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS 0x00400000
+#endif
+
+inline bool IsCloudPlaceholderAttrs(DWORD attrs) {
+    return (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) != 0 ||
+           (attrs & FILE_ATTRIBUTE_RECALL_ON_OPEN) != 0 ||
+           ((attrs & FILE_ATTRIBUTE_OFFLINE) != 0 && (attrs & FILE_ATTRIBUTE_SPARSE_FILE) != 0);
+}
+
 struct HandleGuard {
     HANDLE h = INVALID_HANDLE_VALUE;
     ~HandleGuard() {
@@ -133,6 +146,7 @@ std::unique_ptr<DiskTree> FinalizeTree(
         }
         if (childBuf.size() > 1) {
             std::sort(childBuf.begin(), childBuf.end(), [&](uint32_t a, uint32_t b) {
+                if (nodes[a].allocated != nodes[b].allocated) return nodes[a].allocated > nodes[b].allocated;
                 if (nodes[a].size != nodes[b].size) return nodes[a].size > nodes[b].size;
                 return nodes[a].is_dir() > nodes[b].is_dir();
             });
@@ -529,6 +543,13 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
                     if (stdAttrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
                     if (stdAttrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
                     if (stdAttrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
+                    if (IsCloudPlaceholderAttrs(stdAttrs)) {
+                        flags |= FLAG_IS_CLOUD;
+                        if (stdAttrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
+                            allocSize = 0;
+                        }
+                    }
+                    if (stdAttrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
 
                     uint32_t nameOff = static_cast<uint32_t>(out.names.size());
                     out.names.insert(out.names.end(), bestNamePtr, bestNamePtr + bestNameLen);
@@ -826,9 +847,31 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
                     if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
                     if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
                     if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
+                    if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
 
                     uint64_t sz = isDir ? 0 : ((static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow);
-                    uint64_t alloc = sz == 0 ? 0 : (((sz + 4095) / 4096) * 4096);
+                    uint64_t alloc = 0;
+                    if (!isDir && sz > 0) {
+                        if (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
+                            alloc = 0;
+                        } else if (attrs & (FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED)) {
+                            std::wstring fullItem = res.parent_path;
+                            if (!fullItem.empty() && fullItem.back() != L'\\') fullItem.push_back(L'\\');
+                            fullItem.append(fn, len);
+                            if (fullItem.size() >= 240 && fullItem.rfind(L"\\\\?\\", 0) != 0) {
+                                fullItem = L"\\\\?\\" + fullItem;
+                            }
+                            DWORD hi = 0;
+                            DWORD lo = GetCompressedFileSizeW(fullItem.c_str(), &hi);
+                            if (lo != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) {
+                                alloc = (static_cast<uint64_t>(hi) << 32) | lo;
+                            } else {
+                                alloc = (((sz + 4095) / 4096) * 4096);
+                            }
+                        } else {
+                            alloc = (((sz + 4095) / 4096) * 4096);
+                        }
+                    }
                     int64_t mod = (static_cast<int64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
 
                     if (!isDir) {

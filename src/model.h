@@ -14,6 +14,7 @@ constexpr uint8_t FLAG_IS_DIR        = 1 << 0;
 constexpr uint8_t FLAG_IS_HIDDEN     = 1 << 1;
 constexpr uint8_t FLAG_IS_SYSTEM     = 1 << 2;
 constexpr uint8_t FLAG_IS_COMPRESSED = 1 << 3;
+constexpr uint8_t FLAG_IS_CLOUD      = 1 << 4;
 
 enum class ScanMode : uint8_t {
     NtfsMft = 0,
@@ -39,6 +40,7 @@ struct TreeNode {
     uint8_t  flags;
 
     inline bool is_dir() const { return (flags & FLAG_IS_DIR) != 0; }
+    inline bool is_cloud() const { return (flags & FLAG_IS_CLOUD) != 0; }
 };
 
 struct ExtStat {
