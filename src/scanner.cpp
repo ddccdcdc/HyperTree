@@ -11,7 +11,7 @@
 namespace {
 
 constexpr uint64_t NTFS_ROOT_FRN = 5;
-constexpr size_t   MFT_CHUNK_BYTES = 8 * 1024 * 1024; // 8 MB sequential reads
+constexpr size_t   MFT_CHUNK_BYTES = 16 * 1024 * 1024; // 16 MB sequential reads
 
 #ifndef FILE_ATTRIBUTE_RECALL_ON_OPEN
 #define FILE_ATTRIBUTE_RECALL_ON_OPEN 0x00040000
@@ -87,9 +87,13 @@ std::unique_ptr<DiskTree> FinalizeTree(
     }
 
     // Iterative BFS for topological order
+    std::vector<uint8_t> visited(n, 0);
     std::vector<uint32_t> order;
     order.reserve(n);
-    order.push_back(root_idx);
+    if (root_idx < n) {
+        visited[root_idx] = 1;
+        order.push_back(root_idx);
+    }
     size_t head = 0;
     while (head < order.size()) {
         if ((head & 0xFFFF) == 0 && progress.is_cancelled()) {
@@ -98,8 +102,11 @@ std::unique_ptr<DiskTree> FinalizeTree(
         }
         uint32_t cur = order[head++];
         uint32_t c = nodes[cur].first_child;
-        while (c != NONE_IDX) {
-            order.push_back(c);
+        while (c != NONE_IDX && c < n) {
+            if (!visited[c]) {
+                visited[c] = 1;
+                order.push_back(c);
+            }
             c = nodes[c].next_sibling;
         }
     }
@@ -402,11 +409,12 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
     std::vector<std::thread> workers;
     workers.reserve(numWorkers);
 
+    const size_t estPerWorker = std::max<size_t>(32768, static_cast<size_t>((mftValidBytes / recordSize) / numWorkers));
     for (unsigned w = 0; w < numWorkers; ++w) {
-        workers.emplace_back([&, w]() {
+        workers.emplace_back([&, w, estPerWorker]() {
             auto& out = workerOutputs[w];
-            out.records.reserve(32768);
-            out.names.reserve(32768 * 16);
+            out.records.reserve(estPerWorker);
+            out.names.reserve(estPerWorker * 18);
 
             while (true) {
                 MftChunk chunk;
@@ -454,6 +462,7 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
 
                     size_t attrOff = ReadU16(rec + 20);
                     size_t bytesUsed = std::min<size_t>(ReadU32(rec + 24), recordSize);
+                    if (attrOff < 42 || attrOff >= bytesUsed) continue;
 
                     int64_t modified = 0;
                     uint32_t stdAttrs = 0;
@@ -842,7 +851,7 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
 
                 bool usedFileId = false;
                 if (hDir.h != INVALID_HANDLE_VALUE) {
-                    thread_local std::vector<uint8_t> dirBuf(65536);
+                    thread_local std::vector<uint8_t> dirBuf(131072);
                     if (GetFileInformationByHandleEx(hDir.h, FileIdBothDirectoryInfo, dirBuf.data(), static_cast<DWORD>(dirBuf.size()))) {
                         usedFileId = true;
                         do {

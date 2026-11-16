@@ -494,6 +494,33 @@ void SortFileTypes() {
     InvalidateRect(g_app.listTypes, nullptr, FALSE);
 }
 
+inline wchar_t FastToLower(wchar_t c) {
+    if (c >= L'A' && c <= L'Z') return static_cast<wchar_t>(c - L'A' + L'a');
+    if (c < 128) return c;
+    return static_cast<wchar_t>(towlower(c));
+}
+
+bool ContainsCaseInsensitive(std::wstring_view hay, std::wstring_view lowerNeedle) {
+    if (lowerNeedle.empty()) return true;
+    if (hay.size() < lowerNeedle.size()) return false;
+    const size_t limit = hay.size() - lowerNeedle.size();
+    for (size_t i = 0; i <= limit; ++i) {
+        size_t j = 0;
+        while (j < lowerNeedle.size() && FastToLower(hay[i + j]) == lowerNeedle[j]) ++j;
+        if (j == lowerNeedle.size()) return true;
+    }
+    return false;
+}
+
+bool EndsWithCaseInsensitive(std::wstring_view hay, std::wstring_view lowerSuffix) {
+    if (hay.size() < lowerSuffix.size()) return false;
+    size_t off = hay.size() - lowerSuffix.size();
+    for (size_t i = 0; i < lowerSuffix.size(); ++i) {
+        if (FastToLower(hay[off + i]) != lowerSuffix[i]) return false;
+    }
+    return true;
+}
+
 void RebuildFileFilter() {
     g_app.filteredFiles.clear();
     if (!g_app.tree) {
@@ -504,7 +531,7 @@ void RebuildFileFilter() {
     wchar_t qBuf[256]{};
     GetWindowTextW(g_app.editSearch, qBuf, 255);
     std::wstring q(qBuf);
-    for (auto& c : q) c = static_cast<wchar_t>(towlower(c));
+    for (auto& c : q) c = FastToLower(c);
 
     int minSel = static_cast<int>(SendMessageW(g_app.minSizeCombo, CB_GETCURSEL, 0, 0));
     uint64_t minBytes = 0;
@@ -514,24 +541,22 @@ void RebuildFileFilter() {
     else if (minSel == 4) minBytes = 1024ULL * 1024ULL * 1024ULL;
 
     const size_t cap = 200000;
-    std::wstring extFilter;
-    if (q.size() > 2 && q[0] == L'*' && q[1] == L'.') extFilter = q.substr(1);
+    std::wstring_view extFilter;
+    if (q.size() > 2 && q[0] == L'*' && q[1] == L'.') extFilter = std::wstring_view(q).substr(1);
+    const bool pathSearch = (q.find(L'\\') != std::wstring::npos || q.find(L'/') != std::wstring::npos);
+
     for (uint32_t idx : g_app.tree->top_files) {
         const auto& n = g_app.tree->nodes[idx];
         if (n.size < minBytes) break;
         if (!g_app.showSystemFiles && (n.flags & FLAG_IS_SYSTEM) != 0) continue;
         if (!q.empty()) {
             if (!extFilter.empty()) {
-                std::wstring name(g_app.tree->node_name(idx));
-                for (auto& c : name) c = static_cast<wchar_t>(towlower(c));
-                if (name.size() < extFilter.size() ||
-                    name.compare(name.size() - extFilter.size(), extFilter.size(), extFilter) != 0) {
-                    continue;
-                }
+                if (!EndsWithCaseInsensitive(g_app.tree->node_name(idx), extFilter)) continue;
+            } else if (!pathSearch) {
+                if (!ContainsCaseInsensitive(g_app.tree->node_name(idx), q)) continue;
             } else {
                 std::wstring full = g_app.tree->full_path(idx);
-                for (auto& c : full) c = static_cast<wchar_t>(towlower(c));
-                if (full.find(q) == std::wstring::npos) continue;
+                if (!ContainsCaseInsensitive(full, q)) continue;
             }
         }
         g_app.filteredFiles.push_back(idx);
@@ -971,9 +996,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SetWindowSubclass(g_app.listFiles, lvSub, 1, 0);
             SetWindowSubclass(g_app.listTypes, lvSub, 1, 0);
 
-            g_app.editSearch   = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
+            g_app.editSearch   = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_BORDER | ES_AUTOHSCROLL,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_EDIT_SEARCH), g_app.hInst, nullptr);
             SendMessageW(g_app.editSearch, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            SendMessageW(g_app.editSearch, EM_SETMARGINS, EC_LEFTMARGIN | EC_RIGHTMARGIN, MAKELPARAM(6, 6));
             SendMessageW(g_app.editSearch, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search files or *.ext..."));
             g_app.btnClear     = mk(L"BUTTON", L"Clear", BS_PUSHBUTTON, IDC_BTN_CLEAR);
             g_app.minSizeCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_MINSIZE_CMB);
@@ -1023,7 +1049,24 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             FillRect(reinterpret_cast<HDC>(wp), &rc, g_app.bgBrush);
             return 1;
         }
+        case WM_SETCURSOR: {
+            HWND target = reinterpret_cast<HWND>(wp);
+            if (target == g_app.editSearch) {
+                SetCursor(LoadCursorW(nullptr, IDC_IBEAM));
+                return TRUE;
+            }
+            if (LOWORD(lp) == HTCLIENT) {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+                return TRUE;
+            }
+            break;
+        }
         case WM_TIMER: {
+            if (wp == 2) {
+                KillTimer(hwnd, 2);
+                RebuildFileFilter();
+                return 0;
+            }
             if (wp == 1 && g_app.scanning.load()) {
                 auto phase = static_cast<ScanPhase>(g_app.progress.phase.load(std::memory_order_relaxed));
                 uint64_t files = g_app.progress.files.load(std::memory_order_relaxed);
@@ -1172,10 +1215,12 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.darkMode = !g_app.darkMode;
                 ApplyTheme();
             } else if (id == IDC_EDIT_SEARCH && code == EN_CHANGE) {
-                RebuildFileFilter();
+                KillTimer(hwnd, 2);
+                SetTimer(hwnd, 2, 120, nullptr);
             } else if (id == IDC_MINSIZE_CMB && code == CBN_SELCHANGE) {
                 RebuildFileFilter();
             } else if (id == IDC_BTN_CLEAR) {
+                KillTimer(hwnd, 2);
                 SetWindowTextW(g_app.editSearch, L"");
                 RebuildFileFilter();
             } else if (id == IDC_BTN_TM_UP && g_app.tree) {
