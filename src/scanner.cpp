@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <deque>
 #include <execution>
+#include <unordered_set>
 
 namespace {
 
@@ -750,12 +751,21 @@ std::wstring MakeExtendedPattern(const std::wstring& dir) {
     return L"\\\\?\\" + clean + L"\\*";
 }
 
+inline std::wstring MakeExtendedDirPath(const std::wstring& dirPath) {
+    std::wstring clean = dirPath;
+    while (clean.size() > 3 && clean.back() == L'\\') clean.pop_back();
+    if (clean.rfind(L"\\\\?\\", 0) == 0) return clean;
+    if (clean.rfind(L"\\\\", 0) == 0) return L"\\\\?\\UNC\\" + clean.substr(2);
+    return L"\\\\?\\" + clean;
+}
+
 struct DirEntryRaw {
     uint32_t name_off;
     uint16_t name_len;
     uint64_t size;
     uint64_t allocated;
     int64_t  modified;
+    uint64_t file_id;
     uint8_t  flags;
 };
 
@@ -794,6 +804,7 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
     std::vector<std::pair<uint32_t, std::wstring>> frontier;
     frontier.emplace_back(0, cleanRoot);
 
+    std::unordered_set<uint64_t> seenFileIds;
     while (!frontier.empty()) {
         if (progress.is_cancelled()) {
             outErr = L"Scan cancelled.";
@@ -817,75 +828,142 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
                 res.parent_idx = frontier[i].first;
                 res.parent_path = std::move(frontier[i].second);
 
-                std::wstring pattern = MakeExtendedPattern(res.parent_path);
-                WIN32_FIND_DATAW fd{};
-                HANDLE hFind = FindFirstFileExW(
-                    pattern.c_str(),
-                    FindExInfoBasic,
-                    &fd,
-                    FindExSearchNameMatch,
-                    nullptr,
-                    FIND_FIRST_EX_LARGE_FETCH);
-                if (hFind == INVALID_HANDLE_VALUE) continue;
-
                 uint64_t localFiles = 0, localFolders = 0, localBytes = 0;
-                do {
-                    const wchar_t* fn = fd.cFileName;
-                    if (fn[0] == L'.' && (fn[1] == L'\0' || (fn[1] == L'.' && fn[2] == L'\0'))) {
-                        continue;
-                    }
-                    DWORD attrs = fd.dwFileAttributes;
-                    bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                    bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-                    if (isDir && isReparse) continue; // skip junctions/symlinks
+                std::wstring extDir = MakeExtendedDirPath(res.parent_path);
+                HandleGuard hDir;
+                hDir.h = CreateFileW(
+                    extDir.c_str(),
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    nullptr);
 
-                    size_t len = wcslen(fn);
-                    if (len == 0) continue;
+                bool usedFileId = false;
+                if (hDir.h != INVALID_HANDLE_VALUE) {
+                    thread_local std::vector<uint8_t> dirBuf(65536);
+                    if (GetFileInformationByHandleEx(hDir.h, FileIdBothDirectoryInfo, dirBuf.data(), static_cast<DWORD>(dirBuf.size()))) {
+                        usedFileId = true;
+                        do {
+                            size_t off = 0;
+                            while (true) {
+                                auto* info = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(dirBuf.data() + off);
+                                size_t len = info->FileNameLength / sizeof(wchar_t);
+                                const wchar_t* fn = info->FileName;
+                                bool isDot = (len == 1 && fn[0] == L'.') || (len == 2 && fn[0] == L'.' && fn[1] == L'.');
+                                if (!isDot && len > 0) {
+                                    DWORD attrs = info->FileAttributes;
+                                    bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                                    bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                                    if (!(isDir && isReparse)) {
+                                        uint8_t flags = 0;
+                                        if (isDir) { flags |= FLAG_IS_DIR; ++localFolders; }
+                                        if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
+                                        if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
+                                        if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
+                                        if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
 
-                    uint8_t flags = 0;
-                    if (isDir) { flags |= FLAG_IS_DIR; ++localFolders; }
-                    if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
-                    if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
-                    if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
-                    if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
+                                        uint64_t sz = isDir ? 0 : static_cast<uint64_t>(std::max<LONGLONG>(0, info->EndOfFile.QuadPart));
+                                        uint64_t alloc = 0;
+                                        if (!isDir && sz > 0) {
+                                            if (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
+                                                alloc = 0;
+                                            } else {
+                                                alloc = static_cast<uint64_t>(std::max<LONGLONG>(0, info->AllocationSize.QuadPart));
+                                            }
+                                        }
+                                        int64_t mod = info->LastWriteTime.QuadPart;
+                                        uint64_t fid = static_cast<uint64_t>(info->FileId.QuadPart);
 
-                    uint64_t sz = isDir ? 0 : ((static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow);
-                    uint64_t alloc = 0;
-                    if (!isDir && sz > 0) {
-                        if (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
-                            alloc = 0;
-                        } else if (attrs & (FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED)) {
-                            std::wstring fullItem = res.parent_path;
-                            if (!fullItem.empty() && fullItem.back() != L'\\') fullItem.push_back(L'\\');
-                            fullItem.append(fn, len);
-                            if (fullItem.size() >= 240 && fullItem.rfind(L"\\\\?\\", 0) != 0) {
-                                fullItem = L"\\\\?\\" + fullItem;
+                                        if (!isDir) {
+                                            ++localFiles;
+                                            localBytes += sz;
+                                        }
+                                        uint32_t noff = static_cast<uint32_t>(res.names.size());
+                                        uint16_t nlen = static_cast<uint16_t>(std::min<size_t>(len, 65535));
+                                        res.names.insert(res.names.end(), fn, fn + nlen);
+                                        res.entries.push_back(DirEntryRaw{ noff, nlen, sz, alloc, mod, fid, flags });
+                                    }
+                                }
+                                if (info->NextEntryOffset == 0) break;
+                                off += info->NextEntryOffset;
                             }
-                            DWORD hi = 0;
-                            DWORD lo = GetCompressedFileSizeW(fullItem.c_str(), &hi);
-                            if (lo != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) {
-                                alloc = (static_cast<uint64_t>(hi) << 32) | lo;
+                        } while (!progress.is_cancelled() &&
+                                 GetFileInformationByHandleEx(hDir.h, FileIdBothDirectoryInfo, dirBuf.data(), static_cast<DWORD>(dirBuf.size())));
+                    }
+                }
+
+                if (!usedFileId) {
+                    std::wstring pattern = MakeExtendedPattern(res.parent_path);
+                    WIN32_FIND_DATAW fd{};
+                    HANDLE hFind = FindFirstFileExW(
+                        pattern.c_str(),
+                        FindExInfoBasic,
+                        &fd,
+                        FindExSearchNameMatch,
+                        nullptr,
+                        FIND_FIRST_EX_LARGE_FETCH);
+                    if (hFind == INVALID_HANDLE_VALUE) continue;
+
+                    do {
+                        const wchar_t* fn = fd.cFileName;
+                        if (fn[0] == L'.' && (fn[1] == L'\0' || (fn[1] == L'.' && fn[2] == L'\0'))) {
+                            continue;
+                        }
+                        DWORD attrs = fd.dwFileAttributes;
+                        bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                        bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                        if (isDir && isReparse) continue; // skip junctions/symlinks
+
+                        size_t len = wcslen(fn);
+                        if (len == 0) continue;
+
+                        uint8_t flags = 0;
+                        if (isDir) { flags |= FLAG_IS_DIR; ++localFolders; }
+                        if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
+                        if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
+                        if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
+                        if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
+
+                        uint64_t sz = isDir ? 0 : ((static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow);
+                        uint64_t alloc = 0;
+                        if (!isDir && sz > 0) {
+                            if (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
+                                alloc = 0;
+                            } else if (attrs & (FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED)) {
+                                std::wstring fullItem = res.parent_path;
+                                if (!fullItem.empty() && fullItem.back() != L'\\') fullItem.push_back(L'\\');
+                                fullItem.append(fn, len);
+                                if (fullItem.size() >= 240 && fullItem.rfind(L"\\\\?\\", 0) != 0) {
+                                    fullItem = L"\\\\?\\" + fullItem;
+                                }
+                                DWORD hi = 0;
+                                DWORD lo = GetCompressedFileSizeW(fullItem.c_str(), &hi);
+                                if (lo != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) {
+                                    alloc = (static_cast<uint64_t>(hi) << 32) | lo;
+                                } else {
+                                    alloc = (((sz + 4095) / 4096) * 4096);
+                                }
                             } else {
                                 alloc = (((sz + 4095) / 4096) * 4096);
                             }
-                        } else {
-                            alloc = (((sz + 4095) / 4096) * 4096);
                         }
-                    }
-                    int64_t mod = (static_cast<int64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
+                        int64_t mod = (static_cast<int64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
 
-                    if (!isDir) {
-                        ++localFiles;
-                        localBytes += sz;
-                    }
+                        if (!isDir) {
+                            ++localFiles;
+                            localBytes += sz;
+                        }
 
-                    uint32_t noff = static_cast<uint32_t>(res.names.size());
-                    uint16_t nlen = static_cast<uint16_t>(std::min<size_t>(len, 65535));
-                    res.names.insert(res.names.end(), fn, fn + nlen);
-                    res.entries.push_back(DirEntryRaw{ noff, nlen, sz, alloc, mod, flags });
-                } while (FindNextFileW(hFind, &fd));
+                        uint32_t noff = static_cast<uint32_t>(res.names.size());
+                        uint16_t nlen = static_cast<uint16_t>(std::min<size_t>(len, 65535));
+                        res.names.insert(res.names.end(), fn, fn + nlen);
+                        res.entries.push_back(DirEntryRaw{ noff, nlen, sz, alloc, mod, 0, flags });
+                    } while (FindNextFileW(hFind, &fd));
 
-                FindClose(hFind);
+                    FindClose(hFind);
+                }
                 progress.files.fetch_add(localFiles, std::memory_order_relaxed);
                 progress.folders.fetch_add(localFolders, std::memory_order_relaxed);
                 progress.bytes_processed.fetch_add(localBytes, std::memory_order_relaxed);
@@ -911,10 +989,14 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
                 uint32_t nameOff = static_cast<uint32_t>(names.size());
                 names.insert(names.end(), res.names.data() + e.name_off, res.names.data() + e.name_off + e.name_len);
                 bool isDir = (e.flags & FLAG_IS_DIR) != 0;
+                uint64_t alloc = e.allocated;
+                if (!isDir && e.file_id != 0 && !seenFileIds.insert(e.file_id).second) {
+                    alloc = 0; // Hard link already counted once on disk
+                }
                 uint16_t extId = isDir ? 0 : interner.intern(std::wstring_view(names.data() + nameOff, e.name_len));
 
                 nodes.push_back(TreeNode{
-                    e.size, e.allocated, e.modified,
+                    e.size, alloc, e.modified,
                     res.parent_idx, NONE_IDX, NONE_IDX, 0, 0,
                     nameOff, e.name_len, extId, e.flags
                 });
