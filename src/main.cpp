@@ -28,8 +28,9 @@
 #include <thread>
 #include <unordered_set>
 
-constexpr UINT WM_SCAN_DONE  = WM_APP + 1;
-constexpr UINT WM_TM_SELECT  = WM_APP + 10;
+constexpr UINT WM_SCAN_DONE   = WM_APP + 1;
+constexpr UINT WM_SEARCH_DONE = WM_APP + 2;
+constexpr UINT WM_TM_SELECT   = WM_APP + 10;
 constexpr UINT WM_TM_ZOOM    = WM_APP + 11;
 constexpr UINT WM_TM_CONTEXT = WM_APP + 12;
 
@@ -121,10 +122,14 @@ struct AppState {
     ScanResult pendingResult;
 
     // Data
-    std::unique_ptr<DiskTree> tree;
+    std::shared_ptr<DiskTree> tree;
     std::unordered_set<uint32_t> expanded;
     std::vector<FlatRow> flatRows;
     std::vector<uint32_t> filteredFiles;
+    std::atomic<uint64_t> searchGen{ 0 };
+    std::mutex searchMtx;
+    std::vector<uint32_t> pendingSearchResults;
+    uint64_t pendingSearchGen = 0;
     std::vector<size_t> sortedTypeIndices;
     uint32_t selectedNode = NONE_IDX;
     uint32_t treemapRoot = 0;
@@ -522,8 +527,10 @@ bool EndsWithCaseInsensitive(std::wstring_view hay, std::wstring_view lowerSuffi
 }
 
 void RebuildFileFilter() {
-    g_app.filteredFiles.clear();
-    if (!g_app.tree) {
+    uint64_t myGen = g_app.searchGen.fetch_add(1, std::memory_order_relaxed) + 1;
+    auto tree = g_app.tree;
+    if (!tree) {
+        g_app.filteredFiles.clear();
         ListView_SetItemCountEx(g_app.listFiles, 0, 0);
         return;
     }
@@ -540,33 +547,76 @@ void RebuildFileFilter() {
     else if (minSel == 3) minBytes = 100ULL * 1024ULL * 1024ULL;
     else if (minSel == 4) minBytes = 1024ULL * 1024ULL * 1024ULL;
 
-    const size_t cap = 200000;
-    std::wstring_view extFilter;
-    if (q.size() > 2 && q[0] == L'*' && q[1] == L'.') extFilter = std::wstring_view(q).substr(1);
-    const bool pathSearch = (q.find(L'\\') != std::wstring::npos || q.find(L'/') != std::wstring::npos);
+    bool showSys = g_app.showSystemFiles;
+    int sortCol = g_app.fileSortCol;
+    bool sortAsc = g_app.fileSortAsc;
+    HWND hwnd = g_app.hwnd;
 
-    for (uint32_t idx : g_app.tree->top_files) {
-        const auto& n = g_app.tree->nodes[idx];
-        if (n.size < minBytes) break;
-        if (!g_app.showSystemFiles && (n.flags & FLAG_IS_SYSTEM) != 0) continue;
-        if (!q.empty()) {
-            if (!extFilter.empty()) {
-                if (!EndsWithCaseInsensitive(g_app.tree->node_name(idx), extFilter)) continue;
-            } else if (!pathSearch) {
-                if (!ContainsCaseInsensitive(g_app.tree->node_name(idx), q)) continue;
-            } else {
-                std::wstring full = g_app.tree->full_path(idx);
-                if (!ContainsCaseInsensitive(full, q)) continue;
+    std::thread([tree, myGen, q = std::move(q), minBytes, showSys, sortCol, sortAsc, hwnd]() {
+        std::vector<uint32_t> out;
+        const size_t cap = 200000;
+        out.reserve(q.empty() ? std::min(cap, tree->top_files.size()) : 1024);
+
+        std::wstring_view extFilter;
+        if (q.size() > 2 && q[0] == L'*' && q[1] == L'.') extFilter = std::wstring_view(q).substr(1);
+        const bool pathSearch = (q.find(L'\\') != std::wstring::npos || q.find(L'/') != std::wstring::npos);
+
+        size_t iter = 0;
+        for (uint32_t idx : tree->top_files) {
+            if ((++iter & 4095) == 0 && g_app.searchGen.load(std::memory_order_relaxed) != myGen) {
+                return;
+            }
+            const auto& n = tree->nodes[idx];
+            if (n.size < minBytes) break;
+            if (!showSys && (n.flags & FLAG_IS_SYSTEM) != 0) continue;
+            if (!q.empty()) {
+                if (!extFilter.empty()) {
+                    if (!EndsWithCaseInsensitive(tree->node_name(idx), extFilter)) continue;
+                } else if (!pathSearch) {
+                    if (!ContainsCaseInsensitive(tree->node_name(idx), q)) continue;
+                } else {
+                    std::wstring full = tree->full_path(idx);
+                    if (!ContainsCaseInsensitive(full, q)) continue;
+                }
+            }
+            out.push_back(idx);
+            if (out.size() >= cap) break;
+        }
+
+        if (g_app.searchGen.load(std::memory_order_relaxed) != myGen) return;
+
+        if (sortCol != 1 || sortAsc) {
+            std::sort(out.begin(), out.end(), [&](uint32_t a, uint32_t b) {
+                const auto& na = tree->nodes[a];
+                const auto& nb = tree->nodes[b];
+                int cmp = 0;
+                switch (sortCol) {
+                    case 0: {
+                        auto sa = tree->node_name(a);
+                        auto sb = tree->node_name(b);
+                        cmp = _wcsnicmp(sa.data(), sb.data(), std::min(sa.size(), sb.size()));
+                        if (cmp == 0 && sa.size() != sb.size()) cmp = (sa.size() < sb.size()) ? -1 : 1;
+                        break;
+                    }
+                    case 1: cmp = (na.size < nb.size) ? -1 : (na.size > nb.size ? 1 : 0); break;
+                    case 2: cmp = (na.allocated < nb.allocated) ? -1 : (na.allocated > nb.allocated ? 1 : 0); break;
+                    case 3: cmp = (na.modified < nb.modified) ? -1 : (na.modified > nb.modified ? 1 : 0); break;
+                }
+                return sortAsc ? (cmp < 0) : (cmp > 0);
+            });
+        }
+
+        if (g_app.searchGen.load(std::memory_order_relaxed) != myGen) return;
+
+        {
+            std::lock_guard<std::mutex> lk(g_app.searchMtx);
+            if (g_app.searchGen.load(std::memory_order_relaxed) == myGen) {
+                g_app.pendingSearchResults = std::move(out);
+                g_app.pendingSearchGen = myGen;
+                PostMessageW(hwnd, WM_SEARCH_DONE, 0, 0);
             }
         }
-        g_app.filteredFiles.push_back(idx);
-        if (g_app.filteredFiles.size() >= cap) break;
-    }
-    if (g_app.fileSortCol != 1 || g_app.fileSortAsc) {
-        SortFilteredFiles();
-    }
-    ListView_SetItemCountEx(g_app.listFiles, static_cast<int>(g_app.filteredFiles.size()), LVSICF_NOINVALIDATEALL);
-    InvalidateRect(g_app.listFiles, nullptr, FALSE);
+    }).detach();
 }
 
 void UpdateTreemapHeader() {
@@ -1095,6 +1145,15 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_SEARCH_DONE: {
+            std::lock_guard<std::mutex> lk(g_app.searchMtx);
+            if (g_app.pendingSearchGen == g_app.searchGen.load(std::memory_order_relaxed)) {
+                g_app.filteredFiles = std::move(g_app.pendingSearchResults);
+                ListView_SetItemCountEx(g_app.listFiles, static_cast<int>(g_app.filteredFiles.size()), LVSICF_NOINVALIDATEALL);
+                InvalidateRect(g_app.listFiles, nullptr, FALSE);
+            }
+            return 0;
+        }
         case WM_SCAN_DONE: {
             KillTimer(hwnd, 1);
             SetWindowTextW(g_app.btnScan, GetLangStrings(g_app.lang).btn_scan);
@@ -1216,7 +1275,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ApplyTheme();
             } else if (id == IDC_EDIT_SEARCH && code == EN_CHANGE) {
                 KillTimer(hwnd, 2);
-                SetTimer(hwnd, 2, 120, nullptr);
+                SetTimer(hwnd, 2, 40, nullptr);
             } else if (id == IDC_MINSIZE_CMB && code == CBN_SELCHANGE) {
                 RebuildFileFilter();
             } else if (id == IDC_BTN_CLEAR) {
