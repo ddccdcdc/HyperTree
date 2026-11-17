@@ -32,10 +32,10 @@
 - **True On-Disk Allocated Space Accuracy**
   - **Hard-Link Deduplication (`WinSxS` / `System32`)**: Deduplicates 64-bit NTFS `FileId`s across both `$MFT` and standard modes with contiguous open-addressed `FlatFileIdSet` hashing so hard-linked system files are never double-counted.
   - **OneDrive Files On-Demand & Sparse Files**: Detects `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` / `FILE_ATTRIBUTE_RECALL_ON_OPEN` cloud placeholders and sparse/compressed files, weighting the treemap, folder sorting, and `% Parent` bars by **actual allocated disk usage** so cloud-only placeholders (`0 B` allocated) never skew your disk map.
-- **Unified Visibility Filters & Power File Search**
-  - **Global `Filters ▾` Menu (Synced across Tree View, File View & Treemap)**: Toggle **Show System Files** (`FILE_ATTRIBUTE_SYSTEM`, hidden by default), **Hide Hidden Files**, **Hide Cloud-Only Placeholders**, **Hide Small Items (`< 1 MB` in Tree)**, or **Force Full Rescan (Bypass HyperCache)**.
-  - **File View Category, Age & Size Filters**: Filter instantaneously by type (**Videos**, **Images**, **Audio**, **Archives**, **Documents**, **Executables**, **Code**, **Cloud Only**), modification age (**Last 24 Hours**, **Last 7 Days**, **Last 30 Days**, **Older than 1 Year**), and minimum size (`> 1 MB` to `> 1 GB`, including `> 500 MB`) with live matched count and total byte summary.
-  - **Power Search Query Syntax**: Supports multi-extension OR (`ext:mp4;mkv;mov`, `*.dll`), exclusions (`-winsxs`, `-*.tmp`, `-ext:txt;dll`), inline size operators (`>50mb`, `<1.5gb`), and `\path\ keyword` matching on an asynchronous background thread with zero UI typing lag.
+- **Unified Visibility Filters & Power File Search (12 Languages)**
+  - **Global `Filters ▾` Menu (Synced across Tree View, File View & Treemap)**: Consistent visibility toggles (**Show System Files**, **Show Hidden Files**, **Show Cloud-Only Files**) plus **Hide Items `< 1 MB` (Tree & Map)** with an active filter count badge (`Filters (N) ▾`) and **Force Full Rescan (Bypass Cache)**.
+  - **Localized File View Filters**: Filter instantaneously across all **12 languages** by type (**Videos**, **Images**, **Audio**, **Archives**, **Documents**, **Executables**, **Code**, **Cloud Only**), modification age (**Last 24 Hours**, **Last 7 Days**, **Last 30 Days**, **Older than 1 Year**), and minimum size (`> 1 MB` to `> 1 GB`, including `> 500 MB`) with live matched count and total byte summary.
+  - **Power Search Query Syntax**: Supports wildcards & globs (`*setup*.exe`, `log_2?.txt`), OR alternatives (`*.mp4|*.mkv`), multi-extension lists (`ext:mp4;mkv;mov`, `ext:*.zip;*.7z`), exclusions (`-winsxs`, `-*.tmp`, `-ext:txt;dll`), inline size bounds (`>50mb`, `>=100mb`, `<1.5gb`), and `\path\ keyword` matching on an async background thread with zero typing lag.
 - **Zero-Jank, Always-Responsive UI**
   - **Virtualized Lists (`LVS_OWNERDATA`)**: Renders millions of rows instantaneously with zero scrolling lag.
   - **Direct2D Squarified Treemap**: Interactive cushion/tile visualization with hover tooltips, click-to-select, right-click actions, and double-click folder zoom.
@@ -51,7 +51,7 @@
 
 ## Quick Start
 
-1. Click the **Download `hypertree.exe`** button above (single standalone executable, ~487 KB, no installer required).
+1. Click the **Download `hypertree.exe`** button above (single standalone executable, ~496 KB, no installer required).
 2. Run `hypertree.exe`—it opens immediately in standard mode without requiring Administrator privileges (`asInvoker`).
 3. *(Optional)* Click **Elevate (MFT Mode)** in the toolbar at any time to relaunch as Administrator for raw NTFS `$MFT` + live USN Journal scanning (including locked system folders such as `System Volume Information` and `WindowsApps`).
 4. Choose a drive or folder (or pass a folder path via CLI: `hypertree.exe "D:\Projects"`) and click **Scan** (`F5`). Hold `Shift` while clicking **Scan** (or use **Filters → Force Full Rescan**) to bypass `HyperCache`.

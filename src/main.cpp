@@ -162,6 +162,7 @@ struct AppState {
     std::vector<uint32_t> pendingSearchResults;
     uint64_t pendingSearchGen = 0;
     uint64_t pendingSearchTotalBytes = 0;
+    uint64_t filteredTotalBytes = 0;
     std::vector<size_t> sortedTypeIndices;
     uint32_t selectedNode = NONE_IDX;
     uint32_t treemapRoot = 0;
@@ -532,6 +533,50 @@ void SetWindowRtl(HWND h, bool rtl) {
 
 void UpdateTreemapHeader();
 
+void RepopulateCombo(HWND cmb, std::initializer_list<const wchar_t*> items) {
+    if (!cmb) return;
+    int sel = static_cast<int>(SendMessageW(cmb, CB_GETCURSEL, 0, 0));
+    if (sel < 0) sel = 0;
+    SendMessageW(cmb, CB_RESETCONTENT, 0, 0);
+    for (const wchar_t* item : items) {
+        SendMessageW(cmb, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(item));
+    }
+    int count = static_cast<int>(items.size());
+    SendMessageW(cmb, CB_SETCURSEL, sel < count ? sel : 0, 0);
+}
+
+void UpdateFilterButtonLabel() {
+    if (!g_app.btnFilters) return;
+    const auto& L = GetLangStrings(g_app.lang);
+    int activeExtra = (g_app.hideHiddenFiles ? 1 : 0) +
+                      (g_app.hideCloudFiles ? 1 : 0) +
+                      (g_app.hideSmallInTree ? 1 : 0);
+    wchar_t buf[64];
+    if (activeExtra > 0) {
+        swprintf_s(buf, L"%s (%d) \u25BE", L.btn_filters, activeExtra);
+    } else {
+        swprintf_s(buf, L"%s \u25BE", L.btn_filters);
+    }
+    SetWindowTextW(g_app.btnFilters, buf);
+}
+
+void UpdateFilterSummaryLabel() {
+    if (!g_app.filterLbl) return;
+    if (!g_app.tree) {
+        SetWindowTextW(g_app.filterLbl, L"");
+        return;
+    }
+    const auto& L = GetLangStrings(g_app.lang);
+    wchar_t fbuf[160];
+    swprintf_s(fbuf, L"%s %s (%s)%s%s",
+        FormatCount(g_app.filteredFiles.size()).c_str(),
+        L.lbl_files_unit,
+        FormatBytes(g_app.filteredTotalBytes).c_str(),
+        g_app.filteredFiles.size() >= 200000 ? L"  " : L"",
+        g_app.filteredFiles.size() >= 200000 ? L.lbl_cap_suffix : L"");
+    SetWindowTextW(g_app.filterLbl, fbuf);
+}
+
 void ApplyLanguage() {
     const auto& L = GetLangStrings(g_app.lang);
     SetWindowTextW(g_app.hwnd, L"HyperTree");
@@ -541,12 +586,18 @@ void ApplyLanguage() {
     SetWindowTextW(g_app.btnExport, L.btn_export);
     SetWindowTextW(g_app.chkTreemap, L.chk_treemap);
     SetWindowTextW(g_app.chkSystem, L.chk_system);
+    UpdateFilterButtonLabel();
     SetWindowTextW(g_app.btnLang, L.btn_lang);
     SetWindowTextW(g_app.btnTheme, g_app.darkMode ? L.btn_light : L.btn_dark);
     SetWindowTextW(g_app.btnClear, L.btn_clear);
     SetWindowTextW(g_app.btnTmUp, L.btn_up);
     SetWindowTextW(g_app.btnTmRoot, L.btn_root);
     SendMessageW(g_app.editSearch, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L.search_hint));
+
+    RepopulateCombo(g_app.minSizeCombo, { L.size_all, L"> 1 MB", L"> 10 MB", L"> 100 MB", L"> 500 MB", L"> 1 GB" });
+    RepopulateCombo(g_app.catCombo, { L.cat_all, L.cat_videos, L.cat_images, L.cat_audio, L.cat_archives, L.cat_docs, L.cat_exec, L.cat_code, L.cat_cloud });
+    RepopulateCombo(g_app.ageCombo, { L.age_any, L.age_24h, L.age_7d, L.age_30d, L.age_1y });
+    UpdateFilterSummaryLabel();
 
     if (!g_app.tree && !g_app.scanning.load()) {
         SetWindowTextW(g_app.statusLbl, L.status_ready);
@@ -649,7 +700,7 @@ void RebuildFlatRows() {
         if (!vis.AllowsNode(n, idx == g_app.tree->root_idx, true)) {
             continue;
         }
-        bool hasChildren = n.is_dir() && n.first_child != NONE_IDX;
+        bool hasChildren = n.is_dir() && HasVisibleChild(*g_app.tree, idx, vis);
         bool isExp = hasChildren && g_app.expanded.count(idx) > 0;
         g_app.flatRows.push_back(FlatRow{ idx, depth, hasChildren, isExp });
         if (isExp) {
@@ -728,6 +779,7 @@ void RebuildFileFilter() {
         ? static_cast<AgeFilter>(ageSel) : AgeFilter::Any;
 
     VisibilityFilter vis = g_app.CurrentVisibilityFilter();
+    if (cat == FileCategory::CloudOnly) vis.hide_cloud = false;
     int sortCol = g_app.fileSortCol;
     bool sortAsc = g_app.fileSortAsc;
     HWND hwnd = g_app.hwnd;
@@ -836,18 +888,18 @@ void LayoutControls() {
 
     // Row 1: Toolbar
     int x = pad;
-    int comboW = std::min(300, std::max(90, W - 822));
+    int comboW = std::min(300, std::max(90, W - 852));
     MoveWindow(g_app.driveCombo, x, y, comboW, 240, TRUE); x += comboW + 6;
     MoveWindow(g_app.btnFolder, x, y, 76, 26, TRUE); x += 82;
     MoveWindow(g_app.btnScan, x, y, 86, 26, TRUE); x += 92;
     MoveWindow(g_app.btnElevate, x, y, 108, 26, TRUE); x += 114;
     MoveWindow(g_app.btnExport, x, y, 86, 26, TRUE);
 
-    MoveWindow(g_app.btnTheme, W - pad - 60, y, 60, 26, TRUE);
-    MoveWindow(g_app.btnLang, W - pad - 144, y, 78, 26, TRUE);
-    MoveWindow(g_app.chkTreemap, W - pad - 226, y + 3, 76, 20, TRUE);
-    MoveWindow(g_app.chkSystem, W - pad - 332, y + 3, 100, 20, TRUE);
-    MoveWindow(g_app.btnFilters, W - pad - 412, y, 74, 26, TRUE);
+    MoveWindow(g_app.btnTheme, W - pad - 64, y, 64, 26, TRUE);
+    MoveWindow(g_app.btnLang, W - pad - 148, y, 78, 26, TRUE);
+    MoveWindow(g_app.chkTreemap, W - pad - 234, y + 3, 80, 20, TRUE);
+    MoveWindow(g_app.chkSystem, W - pad - 344, y + 3, 104, 20, TRUE);
+    MoveWindow(g_app.btnFilters, W - pad - 442, y, 92, 26, TRUE);
 
     y += 32;
 
@@ -878,11 +930,11 @@ void LayoutControls() {
 
     // Tab 1: File Search bar + ListView
     MoveWindow(g_app.editSearch, pad, contentY + 2, 240, 24, TRUE);
-    MoveWindow(g_app.btnClear, pad + 246, contentY + 2, 54, 24, TRUE);
-    MoveWindow(g_app.minSizeCombo, pad + 306, contentY + 2, 102, 200, TRUE);
-    MoveWindow(g_app.catCombo, pad + 414, contentY + 2, 118, 220, TRUE);
-    MoveWindow(g_app.ageCombo, pad + 538, contentY + 2, 124, 200, TRUE);
-    int lblX = pad + 670;
+    MoveWindow(g_app.btnClear, pad + 246, contentY + 2, 60, 24, TRUE);
+    MoveWindow(g_app.minSizeCombo, pad + 312, contentY + 2, 108, 200, TRUE);
+    MoveWindow(g_app.catCombo, pad + 426, contentY + 2, 128, 220, TRUE);
+    MoveWindow(g_app.ageCombo, pad + 560, contentY + 2, 136, 200, TRUE);
+    int lblX = pad + 704;
     MoveWindow(g_app.filterLbl, lblX, contentY + 5, std::max(80, W - pad - lblX), 18, TRUE);
     MoveWindow(g_app.listFiles, pad, contentY + 30, W - pad * 2, std::max(60, contentH - 30), TRUE);
 
@@ -923,6 +975,7 @@ void SwitchTab(int tab) {
 
 void ApplyVisibilityFilters() {
     SendMessageW(g_app.chkSystem, BM_SETCHECK, g_app.showSystemFiles ? BST_CHECKED : BST_UNCHECKED, 0);
+    UpdateFilterButtonLabel();
     g_app.treemap.SetFilters(g_app.CurrentVisibilityFilter());
     RebuildFlatRows();
     RebuildFileFilter();
@@ -1265,24 +1318,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(g_app.editSearch, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search files or *.ext..."));
             g_app.btnClear     = mk(L"BUTTON", L"Clear", BS_PUSHBUTTON, IDC_BTN_CLEAR);
             g_app.minSizeCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_MINSIZE_CMB);
-            for (const wchar_t* s : { L"All sizes", L"> 1 MB", L"> 10 MB", L"> 100 MB", L"> 500 MB", L"> 1 GB" }) {
-                SendMessageW(g_app.minSizeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
-            }
-            SendMessageW(g_app.minSizeCombo, CB_SETCURSEL, 0, 0);
-
-            g_app.catCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_CAT_CMB);
-            for (const wchar_t* s : { L"All Types", L"Videos", L"Images", L"Audio", L"Archives", L"Documents", L"Executables", L"Code", L"Cloud Only" }) {
-                SendMessageW(g_app.catCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
-            }
-            SendMessageW(g_app.catCombo, CB_SETCURSEL, 0, 0);
-
-            g_app.ageCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_AGE_CMB);
-            for (const wchar_t* s : { L"Any Time", L"Last 24 Hours", L"Last 7 Days", L"Last 30 Days", L"Older than 1 Year" }) {
-                SendMessageW(g_app.ageCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
-            }
-            SendMessageW(g_app.ageCombo, CB_SETCURSEL, 0, 0);
-
-            g_app.filterLbl = mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, IDC_FILTER_LBL);
+            g_app.catCombo     = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_CAT_CMB);
+            g_app.ageCombo     = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_AGE_CMB);
+            g_app.filterLbl    = mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, IDC_FILTER_LBL);
 
             g_app.btnTmUp   = mk(L"BUTTON", L"Up", BS_PUSHBUTTON, IDC_BTN_TM_UP);
             g_app.btnTmRoot = mk(L"BUTTON", L"Root", BS_PUSHBUTTON, IDC_BTN_TM_ROOT);
@@ -1449,16 +1487,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             std::lock_guard<std::mutex> lk(g_app.searchMtx);
             if (g_app.pendingSearchGen == g_app.searchGen.load(std::memory_order_relaxed)) {
                 g_app.filteredFiles = std::move(g_app.pendingSearchResults);
+                g_app.filteredTotalBytes = g_app.pendingSearchTotalBytes;
                 ListView_SetItemCountEx(g_app.listFiles, static_cast<int>(g_app.filteredFiles.size()), LVSICF_NOINVALIDATEALL);
                 InvalidateRect(g_app.listFiles, nullptr, FALSE);
-                if (g_app.filterLbl) {
-                    wchar_t fbuf[128];
-                    swprintf_s(fbuf, L"%s files  (%s)%s",
-                        FormatCount(g_app.filteredFiles.size()).c_str(),
-                        FormatBytes(g_app.pendingSearchTotalBytes).c_str(),
-                        g_app.filteredFiles.size() >= 200000 ? L"  [cap 200k]" : L"");
-                    SetWindowTextW(g_app.filterLbl, fbuf);
-                }
+                UpdateFilterSummaryLabel();
             }
             return 0;
         }
@@ -1562,13 +1594,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.showSystemFiles = (SendMessageW(g_app.chkSystem, BM_GETCHECK, 0, 0) == BST_CHECKED);
                 ApplyVisibilityFilters();
             } else if (id == IDC_BTN_FILTERS) {
+                const auto& L = GetLangStrings(g_app.lang);
                 HMENU menu = CreatePopupMenu();
-                AppendMenuW(menu, MF_STRING | (g_app.showSystemFiles ? MF_CHECKED : 0), IDM_FLT_SYSTEM, L"Show System Files");
-                AppendMenuW(menu, MF_STRING | (g_app.hideHiddenFiles ? MF_CHECKED : 0), IDM_FLT_HIDDEN, L"Hide Hidden Files");
-                AppendMenuW(menu, MF_STRING | (g_app.hideCloudFiles ? MF_CHECKED : 0), IDM_FLT_CLOUD, L"Hide Cloud-Only Placeholders");
-                AppendMenuW(menu, MF_STRING | (g_app.hideSmallInTree ? MF_CHECKED : 0), IDM_FLT_NOSMALL, L"Hide Small Items (< 1 MB in Tree)");
+                AppendMenuW(menu, MF_STRING | (g_app.showSystemFiles ? MF_CHECKED : 0), IDM_FLT_SYSTEM, L.flt_show_system);
+                AppendMenuW(menu, MF_STRING | (!g_app.hideHiddenFiles ? MF_CHECKED : 0), IDM_FLT_HIDDEN, L.flt_show_hidden);
+                AppendMenuW(menu, MF_STRING | (!g_app.hideCloudFiles ? MF_CHECKED : 0), IDM_FLT_CLOUD, L.flt_show_cloud);
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-                AppendMenuW(menu, MF_STRING | (g_app.scanning.load() ? MF_GRAYED : 0), IDM_FLT_FULLRESCAN, L"Force Full Rescan (Bypass HyperCache)");
+                AppendMenuW(menu, MF_STRING | (g_app.hideSmallInTree ? MF_CHECKED : 0), IDM_FLT_NOSMALL, L.flt_hide_small);
+                AppendMenuW(menu, MF_STRING | (g_app.scanning.load() ? MF_GRAYED : 0), IDM_FLT_FULLRESCAN, L.flt_full_rescan);
 
                 RECT br{};
                 GetWindowRect(g_app.btnFilters, &br);
