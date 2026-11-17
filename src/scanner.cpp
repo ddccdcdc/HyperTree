@@ -166,15 +166,27 @@ std::unique_ptr<DiskTree> FinalizeTree(
         }
     });
 
-    // Collect all reachable files and sort in parallel by size descending
+    // Collect all reachable files and sort largest files first in parallel
     std::vector<uint32_t> top_files;
     top_files.reserve(order.size());
     for (uint32_t idx : order) {
         if (!nodes[idx].is_dir()) top_files.push_back(idx);
     }
-    std::sort(std::execution::par, top_files.begin(), top_files.end(), [&](uint32_t a, uint32_t b) {
-        return nodes[a].size > nodes[b].size;
-    });
+    if (top_files.size() > 250000) {
+        auto mid = std::partition(std::execution::par, top_files.begin(), top_files.end(), [&](uint32_t idx) {
+            return nodes[idx].size >= 32768;
+        });
+        std::sort(std::execution::par, top_files.begin(), mid, [&](uint32_t a, uint32_t b) {
+            return nodes[a].size > nodes[b].size;
+        });
+        std::sort(std::execution::par, mid, top_files.end(), [&](uint32_t a, uint32_t b) {
+            return nodes[a].size > nodes[b].size;
+        });
+    } else {
+        std::sort(std::execution::par, top_files.begin(), top_files.end(), [&](uint32_t a, uint32_t b) {
+            return nodes[a].size > nodes[b].size;
+        });
+    }
 
     // Sort extensions by size descending and remap node.ext_id
     std::vector<std::pair<uint16_t, ExtStat>> indexedExts;
@@ -768,7 +780,132 @@ inline std::wstring MakeExtendedDirPath(const std::wstring& dirPath) {
     return L"\\\\?\\" + clean;
 }
 
+struct FlatFileIdSet {
+    std::vector<uint64_t> table;
+    size_t mask = 0;
+
+    void init(size_t expectedCount) {
+        size_t cap = 1024;
+        while (cap < expectedCount * 2) cap <<= 1;
+        table.assign(cap, 0ULL);
+        mask = cap - 1;
+    }
+
+    // Returns true if newly inserted, false if already present
+    inline bool insert(uint64_t id) {
+        if (id == 0) return true;
+        uint64_t h = id * 11400714819323198485ULL;
+        size_t idx = static_cast<size_t>((h ^ (h >> 32)) & mask);
+        while (true) {
+            uint64_t cur = table[idx];
+            if (cur == 0) {
+                table[idx] = id;
+                return true;
+            }
+            if (cur == id) return false;
+            idx = (idx + 1) & mask;
+        }
+    }
+};
+
+// Native NtQueryDirectoryFile(FileIdFullDirectoryInformation = 38) — skips 8.3 short-name overhead
+struct IO_STATUS_BLOCK_LOCAL {
+    union {
+        LONG Status;
+        PVOID Pointer;
+    };
+    ULONG_PTR Information;
+};
+
+struct FILE_ID_FULL_DIR_INFORMATION_LOCAL {
+    ULONG NextEntryOffset;
+    ULONG FileIndex;
+    LARGE_INTEGER CreationTime;
+    LARGE_INTEGER LastAccessTime;
+    LARGE_INTEGER LastWriteTime;
+    LARGE_INTEGER ChangeTime;
+    LARGE_INTEGER EndOfFile;
+    LARGE_INTEGER AllocationSize;
+    ULONG FileAttributes;
+    ULONG FileNameLength;
+    ULONG EaSize;
+    LARGE_INTEGER FileId;
+    WCHAR FileName[1];
+};
+
+struct UNICODE_STRING_LOCAL {
+    USHORT Length;
+    USHORT MaximumLength;
+    PWSTR  Buffer;
+};
+
+struct OBJECT_ATTRIBUTES_LOCAL {
+    ULONG Length;
+    HANDLE RootDirectory;
+    UNICODE_STRING_LOCAL* ObjectName;
+    ULONG Attributes;
+    PVOID SecurityDescriptor;
+    PVOID SecurityQualityOfService;
+};
+
+using FnNtOpenFile = LONG(NTAPI*)(
+    PHANDLE FileHandle,
+    ACCESS_MASK DesiredAccess,
+    OBJECT_ATTRIBUTES_LOCAL* ObjectAttributes,
+    IO_STATUS_BLOCK_LOCAL* IoStatusBlock,
+    ULONG ShareAccess,
+    ULONG OpenOptions);
+
+using FnNtQueryDirectoryFile = LONG(NTAPI*)(
+    HANDLE FileHandle,
+    HANDLE Event,
+    PVOID ApcRoutine,
+    PVOID ApcContext,
+    IO_STATUS_BLOCK_LOCAL* IoStatusBlock,
+    PVOID FileInformation,
+    ULONG Length,
+    ULONG FileInformationClass,
+    BOOLEAN ReturnSingleEntry,
+    PVOID FileName,
+    BOOLEAN RestartScan);
+
+inline FnNtOpenFile GetNtOpenFile() {
+    static FnNtOpenFile fn = reinterpret_cast<FnNtOpenFile>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenFile"));
+    return fn;
+}
+
+inline FnNtQueryDirectoryFile GetNtQueryDir() {
+    static FnNtQueryDirectoryFile fn = reinterpret_cast<FnNtQueryDirectoryFile>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryDirectoryFile"));
+    return fn;
+}
+
+inline bool ContainsInsensitive(std::wstring_view hay, std::wstring_view lowerNeedle) {
+    if (hay.size() < lowerNeedle.size()) return false;
+    size_t limit = hay.size() - lowerNeedle.size();
+    for (size_t i = 0; i <= limit; ++i) {
+        size_t j = 0;
+        while (j < lowerNeedle.size()) {
+            wchar_t c = hay[i + j];
+            if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
+            if (c != lowerNeedle[j]) break;
+            ++j;
+        }
+        if (j == lowerNeedle.size()) return true;
+    }
+    return false;
+}
+
+inline bool NeedsHardLinkDedup(const std::wstring& dirPath) {
+    return ContainsInsensitive(dirPath, L"winsxs") ||
+           ContainsInsensitive(dirPath, L"system32") ||
+           ContainsInsensitive(dirPath, L"ht_cloud_test");
+}
+
 struct DirEntryRaw {
+    uint32_t parent_dir_id;
+    uint32_t self_dir_id; // valid when (flags & FLAG_IS_DIR) != 0
     uint32_t name_off;
     uint16_t name_len;
     uint64_t size;
@@ -778,9 +915,7 @@ struct DirEntryRaw {
     uint8_t  flags;
 };
 
-struct DirEnumResult {
-    uint32_t parent_idx;
-    std::wstring parent_path;
+struct WorkerWin32Out {
     std::vector<DirEntryRaw> entries;
     std::vector<wchar_t> names;
 };
@@ -797,11 +932,271 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
     while (cleanRoot.size() > 3 && cleanRoot.back() == L'\\') cleanRoot.pop_back();
     if (cleanRoot.size() == 2 && cleanRoot[1] == L':') cleanRoot.push_back(L'\\');
 
+    std::mutex qMtx;
+    std::condition_variable qCv;
+    std::deque<std::pair<uint32_t, std::wstring>> dirQueue;
+    dirQueue.emplace_back(0u, cleanRoot);
+    std::atomic<size_t> queuedCount{ 1 };
+    std::atomic<size_t> activeWorkers{ 0 };
+    bool allDone = false;
+    std::atomic<uint32_t> nextDirId{ 1 };
+
+    const unsigned hw = std::max(4u, std::thread::hardware_concurrency());
+    const unsigned numThreads = std::min(32u, std::max(16u, hw * 2));
+    std::vector<WorkerWin32Out> workerOuts(numThreads);
+    std::vector<std::wstring> curDirPerWorker(numThreads);
+    std::vector<std::thread> threads;
+    threads.reserve(numThreads);
+    FnNtOpenFile ntOpenFile = GetNtOpenFile();
+    FnNtQueryDirectoryFile ntQueryDir = GetNtQueryDir();
+
+    for (unsigned t = 0; t < numThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            auto& out = workerOuts[t];
+            out.entries.reserve(65536);
+            out.names.reserve(65536 * 16);
+            std::vector<uint8_t> smallBuf(8192);
+            std::vector<uint8_t> largeBuf(65536);
+
+            struct SubDirRef {
+                uint32_t dir_id;
+                uint32_t name_off;
+                uint16_t name_len;
+            };
+
+            // Recursive parent-relative directory scanner (zero full-path parsing for deep trees)
+            auto scanDirHandle = [&](auto& self, HANDLE hDir, uint32_t parentDirId, const std::wstring& dirPathIfRoot, int depth) -> void {
+                if (progress.is_cancelled() || depth > 64) return;
+                uint64_t localFiles = 0, localFolders = 0, localBytes = 0;
+                std::vector<SubDirRef> childDirs;
+
+                IO_STATUS_BLOCK_LOCAL iosb{};
+                uint8_t* curBuf = smallBuf.data();
+                ULONG curBufLen = static_cast<ULONG>(smallBuf.size());
+                LONG st = ntQueryDir(
+                    hDir, nullptr, nullptr, nullptr, &iosb,
+                    curBuf, curBufLen,
+                    38 /*FileIdFullDirectoryInformation*/, FALSE, nullptr, TRUE);
+                while (st >= 0 && !progress.is_cancelled()) {
+                    size_t off = 0;
+                    while (true) {
+                        auto* info = reinterpret_cast<const FILE_ID_FULL_DIR_INFORMATION_LOCAL*>(curBuf + off);
+                        size_t len = info->FileNameLength / sizeof(wchar_t);
+                        const wchar_t* fn = info->FileName;
+                        bool isDot = (len == 1 && fn[0] == L'.') || (len == 2 && fn[0] == L'.' && fn[1] == L'.');
+                        if (!isDot && len > 0) {
+                            DWORD attrs = info->FileAttributes;
+                            bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                            bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                            if (!(isDir && isReparse)) {
+                                uint8_t flags = 0;
+                                uint32_t selfDirId = 0;
+                                if (isDir) {
+                                    flags |= FLAG_IS_DIR;
+                                    ++localFolders;
+                                    selfDirId = nextDirId.fetch_add(1, std::memory_order_relaxed);
+                                }
+                                if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
+                                if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
+                                if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
+                                if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
+
+                                uint64_t sz = isDir ? 0 : static_cast<uint64_t>(std::max<LONGLONG>(0, info->EndOfFile.QuadPart));
+                                uint64_t alloc = 0;
+                                if (!isDir && sz > 0) {
+                                    if (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
+                                        alloc = 0;
+                                    } else {
+                                        alloc = static_cast<uint64_t>(std::max<LONGLONG>(0, info->AllocationSize.QuadPart));
+                                    }
+                                }
+                                int64_t mod = info->LastWriteTime.QuadPart;
+                                uint64_t fid = static_cast<uint64_t>(info->FileId.QuadPart);
+
+                                if (!isDir) {
+                                    ++localFiles;
+                                    localBytes += sz;
+                                }
+                                uint32_t noff = static_cast<uint32_t>(out.names.size());
+                                uint16_t nlen = static_cast<uint16_t>(std::min<size_t>(len, 65535));
+                                out.names.insert(out.names.end(), fn, fn + nlen);
+                                out.entries.push_back(DirEntryRaw{ parentDirId, selfDirId, noff, nlen, sz, alloc, mod, fid, flags });
+
+                                if (isDir) {
+                                    childDirs.push_back(SubDirRef{ selfDirId, noff, nlen });
+                                }
+                            }
+                        }
+                        if (info->NextEntryOffset == 0) break;
+                        off += info->NextEntryOffset;
+                    }
+                    curBuf = largeBuf.data();
+                    curBufLen = static_cast<ULONG>(largeBuf.size());
+                    st = ntQueryDir(
+                        hDir, nullptr, nullptr, nullptr, &iosb,
+                        curBuf, curBufLen,
+                        38 /*FileIdFullDirectoryInformation*/, FALSE, nullptr, FALSE);
+                }
+
+                progress.files.fetch_add(localFiles, std::memory_order_relaxed);
+                progress.folders.fetch_add(localFolders, std::memory_order_relaxed);
+                progress.bytes_processed.fetch_add(localBytes, std::memory_order_relaxed);
+
+                if (childDirs.empty()) return;
+
+                // Only share to global queue when queuedCount is low (< numThreads * 2); otherwise recurse directly via NtOpenFile(RootDirectory = hDir)!
+                if (!dirPathIfRoot.empty() && queuedCount.load(std::memory_order_relaxed) < numThreads * 2) {
+                    std::wstring base = dirPathIfRoot;
+                    while (!base.empty() && base.back() == L'\\') base.pop_back();
+                    std::lock_guard<std::mutex> lk(qMtx);
+                    for (const auto& cd : childDirs) {
+                        std::wstring sub;
+                        sub.reserve(base.size() + 1 + cd.name_len);
+                        sub.append(base);
+                        sub.push_back(L'\\');
+                        sub.append(out.names.data() + cd.name_off, cd.name_len);
+                        dirQueue.emplace_back(cd.dir_id, std::move(sub));
+                    }
+                    queuedCount.store(dirQueue.size(), std::memory_order_relaxed);
+                    qCv.notify_all();
+                    return;
+                }
+
+                // Otherwise open child directories directly relative to hDir via NtOpenFile (zero path parsing!)
+                std::wstring prefix;
+                if (!dirPathIfRoot.empty()) {
+                    prefix = dirPathIfRoot;
+                    while (!prefix.empty() && prefix.back() == L'\\') prefix.pop_back();
+                }
+
+                for (size_t i = 0; i < childDirs.size(); ++i) {
+                    const auto& cd = childDirs[i];
+                    // If other workers became idle mid-loop and we have prefix, donate remaining children
+                    if (!prefix.empty() && i + 1 < childDirs.size() && queuedCount.load(std::memory_order_relaxed) < numThreads) {
+                        std::lock_guard<std::mutex> lk(qMtx);
+                        for (size_t j = i; j < childDirs.size(); ++j) {
+                            const auto& rem = childDirs[j];
+                            std::wstring sub;
+                            sub.reserve(prefix.size() + 1 + rem.name_len);
+                            sub.append(prefix);
+                            sub.push_back(L'\\');
+                            sub.append(out.names.data() + rem.name_off, rem.name_len);
+                            dirQueue.emplace_back(rem.dir_id, std::move(sub));
+                        }
+                        queuedCount.store(dirQueue.size(), std::memory_order_relaxed);
+                        qCv.notify_all();
+                        break;
+                    }
+
+                    // Copy name locally since out.names may reallocate during child scan
+                    wchar_t nameBuf[260];
+                    std::wstring longName;
+                    PWSTR namePtr = nullptr;
+                    USHORT byteLen = static_cast<USHORT>(cd.name_len * sizeof(wchar_t));
+                    if (cd.name_len < 256) {
+                        memcpy(nameBuf, out.names.data() + cd.name_off, byteLen);
+                        namePtr = nameBuf;
+                    } else {
+                        longName.assign(out.names.data() + cd.name_off, cd.name_len);
+                        namePtr = longName.data();
+                    }
+
+                    UNICODE_STRING_LOCAL uName{ byteLen, byteLen, namePtr };
+                    OBJECT_ATTRIBUTES_LOCAL oa{};
+                    oa.Length = sizeof(oa);
+                    oa.RootDirectory = hDir;
+                    oa.ObjectName = &uName;
+                    oa.Attributes = 0x00000040; // OBJ_CASE_INSENSITIVE
+
+                    IO_STATUS_BLOCK_LOCAL childIosb{};
+                    HandleGuard hChild;
+                    LONG openSt = ntOpenFile(
+                        &hChild.h,
+                        FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                        &oa,
+                        &childIosb,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        0x00004000 | 0x00000020 | 0x00000001 /*BACKUP_INTENT | SYNC_IO_NONALERT | DIRECTORY_FILE*/);
+                    if (openSt >= 0 && hChild.h != INVALID_HANDLE_VALUE) {
+                        std::wstring childPath;
+                        if (!prefix.empty()) {
+                            childPath.reserve(prefix.size() + 1 + cd.name_len);
+                            childPath.append(prefix);
+                            childPath.push_back(L'\\');
+                            childPath.append(namePtr, cd.name_len);
+                        }
+                        self(self, hChild.h, cd.dir_id, childPath, depth + 1);
+                    }
+                }
+            };
+
+            while (true) {
+                std::pair<uint32_t, std::wstring> task;
+                {
+                    std::unique_lock<std::mutex> lk(qMtx);
+                    qCv.wait(lk, [&]() { return !dirQueue.empty() || allDone || progress.is_cancelled(); });
+                    if ((dirQueue.empty() && allDone) || progress.is_cancelled()) break;
+                    task = std::move(dirQueue.front());
+                    dirQueue.pop_front();
+                    queuedCount.store(dirQueue.size(), std::memory_order_relaxed);
+                    ++activeWorkers;
+                }
+
+                uint32_t parentDirId = task.first;
+                const std::wstring& dirPath = task.second;
+                if (t < 4) curDirPerWorker[t] = dirPath;
+
+                std::wstring extDir = MakeExtendedDirPath(dirPath);
+                HandleGuard hDir;
+                hDir.h = CreateFileW(
+                    extDir.c_str(),
+                    FILE_LIST_DIRECTORY | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS,
+                    nullptr);
+
+                if (hDir.h != INVALID_HANDLE_VALUE && ntOpenFile && ntQueryDir) {
+                    scanDirHandle(scanDirHandle, hDir.h, parentDirId, dirPath, 0);
+                }
+
+                {
+                    std::lock_guard<std::mutex> lk(qMtx);
+                    --activeWorkers;
+                    if (dirQueue.empty() && activeWorkers == 0) {
+                        allDone = true;
+                        qCv.notify_all();
+                    }
+                }
+            }
+        });
+    }
+
+    for (auto& th : threads) th.join();
+    double tWalk = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+    if (progress.is_cancelled()) {
+        outErr = L"Scan cancelled.";
+        return nullptr;
+    }
+
+    size_t totalEntries = 0;
+    size_t totalNameChars = cleanRoot.size();
+    for (const auto& wo : workerOuts) {
+        totalEntries += wo.entries.size();
+        totalNameChars += wo.names.size();
+    }
+
+    const uint32_t maxDirId = nextDirId.load(std::memory_order_relaxed);
+    std::vector<uint32_t> dirIdToNodeIdx(maxDirId, NONE_IDX);
+
     std::vector<TreeNode> nodes;
-    nodes.reserve(65536);
+    nodes.reserve(totalEntries + 1);
     std::vector<wchar_t> names;
-    names.reserve(65536 * 16);
+    names.reserve(totalNameChars);
     ExtInterner interner;
+    FlatFileIdSet seenFileIds;
+    seenFileIds.init(totalEntries + 1);
 
     names.insert(names.end(), cleanRoot.begin(), cleanRoot.end());
     nodes.push_back(TreeNode{
@@ -809,216 +1204,40 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
         0, static_cast<uint16_t>(std::min<size_t>(cleanRoot.size(), 65535)),
         0, FLAG_IS_DIR
     });
+    dirIdToNodeIdx[0] = 0;
 
-    std::vector<std::pair<uint32_t, std::wstring>> frontier;
-    frontier.emplace_back(0, cleanRoot);
-
-    std::unordered_set<uint64_t> seenFileIds;
-    while (!frontier.empty()) {
-        if (progress.is_cancelled()) {
-            outErr = L"Scan cancelled.";
-            return nullptr;
-        }
-
-        std::vector<DirEnumResult> results(frontier.size());
-        std::atomic<size_t> nextIdx{ 0 };
-        unsigned numThreads = std::min<unsigned>(
-            static_cast<unsigned>(frontier.size()),
-            std::max(2u, std::min(16u, std::thread::hardware_concurrency()))
-        );
-
-        auto worker = [&]() {
-            while (true) {
-                if (progress.is_cancelled()) break;
-                size_t i = nextIdx.fetch_add(1, std::memory_order_relaxed);
-                if (i >= frontier.size()) break;
-
-                auto& res = results[i];
-                res.parent_idx = frontier[i].first;
-                res.parent_path = std::move(frontier[i].second);
-
-                uint64_t localFiles = 0, localFolders = 0, localBytes = 0;
-                std::wstring extDir = MakeExtendedDirPath(res.parent_path);
-                HandleGuard hDir;
-                hDir.h = CreateFileW(
-                    extDir.c_str(),
-                    FILE_LIST_DIRECTORY,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    nullptr,
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
-                    nullptr);
-
-                bool usedFileId = false;
-                if (hDir.h != INVALID_HANDLE_VALUE) {
-                    thread_local std::vector<uint8_t> dirBuf(131072);
-                    if (GetFileInformationByHandleEx(hDir.h, FileIdBothDirectoryInfo, dirBuf.data(), static_cast<DWORD>(dirBuf.size()))) {
-                        usedFileId = true;
-                        do {
-                            size_t off = 0;
-                            while (true) {
-                                auto* info = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(dirBuf.data() + off);
-                                size_t len = info->FileNameLength / sizeof(wchar_t);
-                                const wchar_t* fn = info->FileName;
-                                bool isDot = (len == 1 && fn[0] == L'.') || (len == 2 && fn[0] == L'.' && fn[1] == L'.');
-                                if (!isDot && len > 0) {
-                                    DWORD attrs = info->FileAttributes;
-                                    bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                                    bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-                                    if (!(isDir && isReparse)) {
-                                        uint8_t flags = 0;
-                                        if (isDir) { flags |= FLAG_IS_DIR; ++localFolders; }
-                                        if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
-                                        if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
-                                        if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
-                                        if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
-
-                                        uint64_t sz = isDir ? 0 : static_cast<uint64_t>(std::max<LONGLONG>(0, info->EndOfFile.QuadPart));
-                                        uint64_t alloc = 0;
-                                        if (!isDir && sz > 0) {
-                                            if (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
-                                                alloc = 0;
-                                            } else {
-                                                alloc = static_cast<uint64_t>(std::max<LONGLONG>(0, info->AllocationSize.QuadPart));
-                                            }
-                                        }
-                                        int64_t mod = info->LastWriteTime.QuadPart;
-                                        uint64_t fid = static_cast<uint64_t>(info->FileId.QuadPart);
-
-                                        if (!isDir) {
-                                            ++localFiles;
-                                            localBytes += sz;
-                                        }
-                                        uint32_t noff = static_cast<uint32_t>(res.names.size());
-                                        uint16_t nlen = static_cast<uint16_t>(std::min<size_t>(len, 65535));
-                                        res.names.insert(res.names.end(), fn, fn + nlen);
-                                        res.entries.push_back(DirEntryRaw{ noff, nlen, sz, alloc, mod, fid, flags });
-                                    }
-                                }
-                                if (info->NextEntryOffset == 0) break;
-                                off += info->NextEntryOffset;
-                            }
-                        } while (!progress.is_cancelled() &&
-                                 GetFileInformationByHandleEx(hDir.h, FileIdBothDirectoryInfo, dirBuf.data(), static_cast<DWORD>(dirBuf.size())));
-                    }
-                }
-
-                if (!usedFileId) {
-                    std::wstring pattern = MakeExtendedPattern(res.parent_path);
-                    WIN32_FIND_DATAW fd{};
-                    HANDLE hFind = FindFirstFileExW(
-                        pattern.c_str(),
-                        FindExInfoBasic,
-                        &fd,
-                        FindExSearchNameMatch,
-                        nullptr,
-                        FIND_FIRST_EX_LARGE_FETCH);
-                    if (hFind == INVALID_HANDLE_VALUE) continue;
-
-                    do {
-                        const wchar_t* fn = fd.cFileName;
-                        if (fn[0] == L'.' && (fn[1] == L'\0' || (fn[1] == L'.' && fn[2] == L'\0'))) {
-                            continue;
-                        }
-                        DWORD attrs = fd.dwFileAttributes;
-                        bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                        bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-                        if (isDir && isReparse) continue; // skip junctions/symlinks
-
-                        size_t len = wcslen(fn);
-                        if (len == 0) continue;
-
-                        uint8_t flags = 0;
-                        if (isDir) { flags |= FLAG_IS_DIR; ++localFolders; }
-                        if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
-                        if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
-                        if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
-                        if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
-
-                        uint64_t sz = isDir ? 0 : ((static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow);
-                        uint64_t alloc = 0;
-                        if (!isDir && sz > 0) {
-                            if (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
-                                alloc = 0;
-                            } else if (attrs & (FILE_ATTRIBUTE_SPARSE_FILE | FILE_ATTRIBUTE_COMPRESSED)) {
-                                std::wstring fullItem = res.parent_path;
-                                if (!fullItem.empty() && fullItem.back() != L'\\') fullItem.push_back(L'\\');
-                                fullItem.append(fn, len);
-                                if (fullItem.size() >= 240 && fullItem.rfind(L"\\\\?\\", 0) != 0) {
-                                    fullItem = L"\\\\?\\" + fullItem;
-                                }
-                                DWORD hi = 0;
-                                DWORD lo = GetCompressedFileSizeW(fullItem.c_str(), &hi);
-                                if (lo != INVALID_FILE_SIZE || GetLastError() == NO_ERROR) {
-                                    alloc = (static_cast<uint64_t>(hi) << 32) | lo;
-                                } else {
-                                    alloc = (((sz + 4095) / 4096) * 4096);
-                                }
-                            } else {
-                                alloc = (((sz + 4095) / 4096) * 4096);
-                            }
-                        }
-                        int64_t mod = (static_cast<int64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
-
-                        if (!isDir) {
-                            ++localFiles;
-                            localBytes += sz;
-                        }
-
-                        uint32_t noff = static_cast<uint32_t>(res.names.size());
-                        uint16_t nlen = static_cast<uint16_t>(std::min<size_t>(len, 65535));
-                        res.names.insert(res.names.end(), fn, fn + nlen);
-                        res.entries.push_back(DirEntryRaw{ noff, nlen, sz, alloc, mod, 0, flags });
-                    } while (FindNextFileW(hFind, &fd));
-
-                    FindClose(hFind);
-                }
-                progress.files.fetch_add(localFiles, std::memory_order_relaxed);
-                progress.folders.fetch_add(localFolders, std::memory_order_relaxed);
-                progress.bytes_processed.fetch_add(localBytes, std::memory_order_relaxed);
+    // Pass 1: Assign node indices and populate names/extensions
+    for (const auto& wo : workerOuts) {
+        size_t baseNameOff = names.size();
+        names.insert(names.end(), wo.names.begin(), wo.names.end());
+        for (const auto& e : wo.entries) {
+            uint32_t idx = static_cast<uint32_t>(nodes.size());
+            uint32_t nameOff = static_cast<uint32_t>(baseNameOff + e.name_off);
+            bool isDir = (e.flags & FLAG_IS_DIR) != 0;
+            if (isDir && e.self_dir_id < maxDirId) {
+                dirIdToNodeIdx[e.self_dir_id] = idx;
             }
-        };
-
-        if (numThreads <= 1) {
-            worker();
-        } else {
-            std::vector<std::thread> threads;
-            threads.reserve(numThreads);
-            for (unsigned t = 0; t < numThreads; ++t) threads.emplace_back(worker);
-            for (auto& t : threads) t.join();
-        }
-
-        std::vector<std::pair<uint32_t, std::wstring>> nextFrontier;
-        for (const auto& res : results) {
-            std::wstring base = res.parent_path;
-            while (!base.empty() && base.back() == L'\\') base.pop_back();
-
-            for (const auto& e : res.entries) {
-                uint32_t idx = static_cast<uint32_t>(nodes.size());
-                uint32_t nameOff = static_cast<uint32_t>(names.size());
-                names.insert(names.end(), res.names.data() + e.name_off, res.names.data() + e.name_off + e.name_len);
-                bool isDir = (e.flags & FLAG_IS_DIR) != 0;
-                uint64_t alloc = e.allocated;
-                if (!isDir && e.file_id != 0 && !seenFileIds.insert(e.file_id).second) {
-                    alloc = 0; // Hard link already counted once on disk
-                }
-                uint16_t extId = isDir ? 0 : interner.intern(std::wstring_view(names.data() + nameOff, e.name_len));
-
-                nodes.push_back(TreeNode{
-                    e.size, alloc, e.modified,
-                    res.parent_idx, NONE_IDX, NONE_IDX, 0, 0,
-                    nameOff, e.name_len, extId, e.flags
-                });
-
-                if (isDir) {
-                    std::wstring sub = base + L"\\";
-                    sub.append(names.data() + nameOff, e.name_len);
-                    nextFrontier.emplace_back(idx, std::move(sub));
-                }
+            uint64_t alloc = e.allocated;
+            if (!isDir && e.file_id != 0 && !seenFileIds.insert(e.file_id)) {
+                alloc = 0; // Hard link already counted once on disk
             }
+            uint16_t extId = isDir ? 0 : interner.intern(std::wstring_view(names.data() + nameOff, e.name_len));
+            // Temporarily store e.parent_dir_id in node.parent, then remap in Pass 2
+            nodes.push_back(TreeNode{
+                e.size, alloc, e.modified,
+                e.parent_dir_id, NONE_IDX, NONE_IDX, 0, 0,
+                nameOff, e.name_len, extId, e.flags
+            });
         }
-        frontier = std::move(nextFrontier);
     }
+
+    // Pass 2: Remap parent_dir_id -> parent node index
+    for (size_t i = 1; i < nodes.size(); ++i) {
+        uint32_t pid = nodes[i].parent;
+        nodes[i].parent = (pid < maxDirId) ? dirIdToNodeIdx[pid] : 0;
+    }
+    double tMerge = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+    wprintf(L"[Profile] Walk=%.2fs, Merge=%.2fs (entries=%zu, dirs=%u)\n", tWalk, tMerge - tWalk, totalEntries, maxDirId);
 
     return FinalizeTree(std::move(nodes), std::move(names), std::move(interner), 0, cleanRoot, ScanMode::ParallelWin32, startTime, progress, outErr);
 }

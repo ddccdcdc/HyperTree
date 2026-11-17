@@ -30,7 +30,7 @@
 #include <thread>
 #include <unordered_set>
 
-constexpr const wchar_t* APP_VERSION = L"1.2.0";
+constexpr const wchar_t* APP_VERSION = L"1.2.1";
 
 constexpr UINT WM_SCAN_DONE    = WM_APP + 1;
 constexpr UINT WM_SEARCH_DONE  = WM_APP + 2;
@@ -860,9 +860,9 @@ void LayoutControls() {
     int rightUsed = 58;
     MoveWindow(g_app.verLbl, W - pad - 54, y + 2, 54, 18, TRUE);
     if (g_app.updateAvailable) {
-        MoveWindow(g_app.btnUpdate, W - pad - 54 - 126, y - 1, 120, 22, TRUE);
+        MoveWindow(g_app.btnUpdate, W - pad - 54 - 144, y - 1, 138, 22, TRUE);
         ShowWindow(g_app.btnUpdate, SW_SHOW);
-        rightUsed += 126;
+        rightUsed += 144;
     } else {
         ShowWindow(g_app.btnUpdate, SW_HIDE);
     }
@@ -1211,9 +1211,9 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.statusLbl = mk(L"STATIC", L"Select a drive or folder and click Scan.", SS_LEFT | SS_NOPREFIX, IDC_STATUS_LBL);
             std::wstring verTxt = std::wstring(L"v") + APP_VERSION;
             g_app.verLbl = mk(L"STATIC", verTxt.c_str(), SS_RIGHT | SS_NOPREFIX, IDC_VER_LBL);
-            g_app.btnUpdate = CreateWindowExW(0, L"BUTTON", L"Update", WS_CHILD | BS_PUSHBUTTON,
+            g_app.btnUpdate = CreateWindowExW(0, L"BUTTON", L"", WS_CHILD | BS_OWNERDRAW,
                 0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_BTN_UPDATE), g_app.hInst, nullptr);
-            SendMessageW(g_app.btnUpdate, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
+            SendMessageW(g_app.btnUpdate, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.boldFont), TRUE);
 
             g_app.tabCtrl = mk(WC_TABCONTROLW, L"", TCS_TABS, IDC_TABS);
             SetWindowSubclass(g_app.tabCtrl, TabCtrlSubclassProc, 1, 0);
@@ -1344,6 +1344,47 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             }
             return 0;
         }
+        case WM_DRAWITEM: {
+            auto* dis = reinterpret_cast<DRAWITEMSTRUCT*>(lp);
+            if (dis && dis->CtlID == IDC_BTN_UPDATE) {
+                RECT rc = dis->rcItem;
+                bool pressed = (dis->itemState & ODS_SELECTED) != 0;
+                bool disabled = (dis->itemState & ODS_DISABLED) != 0;
+                FillRect(dis->hDC, &rc, g_app.bgBrush);
+
+                COLORREF pillCol = disabled
+                    ? RGB(45, 115, 88)
+                    : (pressed ? RGB(13, 148, 102) : RGB(16, 185, 129));
+                HBRUSH pillBr = CreateSolidBrush(pillCol);
+                HPEN pillPen = CreatePen(PS_SOLID, 1, RGB(52, 211, 153));
+                HGDIOBJ oldBr = SelectObject(dis->hDC, pillBr);
+                HGDIOBJ oldPen = SelectObject(dis->hDC, pillPen);
+                RoundRect(dis->hDC, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
+
+                // Small glowing indicator dot on the left
+                HBRUSH dotBr = CreateSolidBrush(RGB(167, 243, 208));
+                SelectObject(dis->hDC, dotBr);
+                int cy = (rc.top + rc.bottom) / 2;
+                Ellipse(dis->hDC, rc.left + 8, cy - 3, rc.left + 15, cy + 4);
+                DeleteObject(dotBr);
+
+                SelectObject(dis->hDC, oldBr);
+                SelectObject(dis->hDC, oldPen);
+                DeleteObject(pillBr);
+                DeleteObject(pillPen);
+
+                wchar_t txt[64]{};
+                GetWindowTextW(dis->hwndItem, txt, 63);
+                SetBkMode(dis->hDC, TRANSPARENT);
+                SetTextColor(dis->hDC, RGB(255, 255, 255));
+                HGDIOBJ oldFont = SelectObject(dis->hDC, g_app.boldFont);
+                RECT tr{ rc.left + 18, rc.top, rc.right - 6, rc.bottom };
+                DrawTextW(dis->hDC, txt, -1, &tr, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+                SelectObject(dis->hDC, oldFont);
+                return TRUE;
+            }
+            break;
+        }
         case WM_UPDATE_AVAIL: {
             std::wstring ver;
             {
@@ -1351,9 +1392,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 ver = g_app.updateVersion;
             }
             if (!ver.empty()) {
-                std::wstring lbl = L"Update " + ver;
+                std::wstring lbl = L"Upgrade to " + ver;
                 SetWindowTextW(g_app.btnUpdate, lbl.c_str());
                 LayoutControls();
+                InvalidateRect(g_app.btnUpdate, nullptr, TRUE);
             }
             return 0;
         }
@@ -1367,9 +1409,10 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     std::lock_guard<std::mutex> lk(g_app.updateMtx);
                     ver = g_app.updateVersion;
                 }
-                std::wstring lbl = L"Update " + ver;
+                std::wstring lbl = L"Upgrade to " + ver;
                 SetWindowTextW(g_app.btnUpdate, lbl.c_str());
                 EnableWindow(g_app.btnUpdate, TRUE);
+                InvalidateRect(g_app.btnUpdate, nullptr, TRUE);
                 MessageBoxW(hwnd, L"Could not download update automatically. Please check your internet connection.", L"HyperTree", MB_ICONWARNING);
             }
             return 0;
