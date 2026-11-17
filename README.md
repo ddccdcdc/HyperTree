@@ -41,7 +41,7 @@
 ## Quick Start
 
 1. Click the **Download `hypertree.exe`** button above.
-2. Run `hypertree.exe` (accept the Windows Administrator prompt so it can read the NTFS `$MFT` directly).
+2. Run `hypertree.exe` (starts unelevated using the multi-threaded Win32 scanner, or click **Elevate (MFT Mode)** to run as Administrator for 3–6s raw NTFS `$MFT` scanning).
 3. Select your preferred language on first launch.
 4. Choose a drive or folder and click **Scan** (or press `F5`).
 
@@ -61,4 +61,4 @@ This compiles `src\app.rc`, links `src\app.manifest`, and outputs a standalone `
 
 ## License
 
-Copyright © 2026 HyperTree. All Rights Reserved. See [LICENSE](LICENSE).
+Licensed under the **PolyForm Noncommercial License 1.0.0** — free for personal, educational, and non-commercial use; commercial use is prohibited without written permission. See [LICENSE](LICENSE).

@@ -9,6 +9,7 @@
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "uxtheme.lib")
+#pragma comment(lib, "winhttp.lib")
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #include "i18n.h"
@@ -20,6 +21,7 @@
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <uxtheme.h>
+#include <winhttp.h>
 #include <windowsx.h>
 #include <atomic>
 #include <chrono>
@@ -28,9 +30,13 @@
 #include <thread>
 #include <unordered_set>
 
-constexpr UINT WM_SCAN_DONE   = WM_APP + 1;
-constexpr UINT WM_SEARCH_DONE = WM_APP + 2;
-constexpr UINT WM_TM_SELECT   = WM_APP + 10;
+constexpr const wchar_t* APP_VERSION = L"1.2.0";
+
+constexpr UINT WM_SCAN_DONE    = WM_APP + 1;
+constexpr UINT WM_SEARCH_DONE  = WM_APP + 2;
+constexpr UINT WM_UPDATE_AVAIL = WM_APP + 3;
+constexpr UINT WM_UPDATE_DONE  = WM_APP + 4;
+constexpr UINT WM_TM_SELECT    = WM_APP + 10;
 constexpr UINT WM_TM_ZOOM    = WM_APP + 11;
 constexpr UINT WM_TM_CONTEXT = WM_APP + 12;
 
@@ -56,6 +62,8 @@ enum ControlId : int {
     IDC_TM_LBL      = 119,
     IDC_CHK_SYSTEM  = 120,
     IDC_BTN_LANG    = 121,
+    IDC_VER_LBL     = 122,
+    IDC_BTN_UPDATE  = 123,
 };
 
 enum ContextMenuId : UINT {
@@ -112,7 +120,16 @@ struct AppState {
     HWND btnTmUp = nullptr;
     HWND btnTmRoot = nullptr;
     HWND tmLbl = nullptr;
+    HWND verLbl = nullptr;
+    HWND btnUpdate = nullptr;
     TreemapControl treemap;
+
+    // Update state
+    std::mutex updateMtx;
+    std::wstring updateVersion;
+    std::wstring updateUrl;
+    bool updateAvailable = false;
+    std::atomic<bool> updating{ false };
 
     // Scan state
     std::atomic<bool> scanning{ false };
@@ -145,6 +162,173 @@ struct AppState {
 };
 
 AppState g_app;
+
+namespace Updater {
+    struct WinHttpGuard {
+        HINTERNET h = nullptr;
+        ~WinHttpGuard() { if (h) WinHttpCloseHandle(h); }
+    };
+
+    inline bool ParseSemVer(const std::wstring& s, int& maj, int& min, int& pat) {
+        maj = min = pat = 0;
+        const wchar_t* p = s.c_str();
+        if (*p == L'v' || *p == L'V') ++p;
+        return swscanf_s(p, L"%d.%d.%d", &maj, &min, &pat) >= 2;
+    }
+
+    inline bool IsNewerVersion(const std::wstring& latest, const std::wstring& current) {
+        int lm = 0, ln = 0, lp = 0, cm = 0, cn = 0, cp = 0;
+        if (!ParseSemVer(latest, lm, ln, lp) || !ParseSemVer(current, cm, cn, cp)) return false;
+        if (lm != cm) return lm > cm;
+        if (ln != cn) return ln > cn;
+        return lp > cp;
+    }
+
+    inline std::string HttpGetText(const wchar_t* host, const wchar_t* path) {
+        WinHttpGuard ses{ WinHttpOpen(L"HyperTree-Updater/1.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nullptr, nullptr, 0) };
+        if (!ses.h) return {};
+        WinHttpGuard con{ WinHttpConnect(ses.h, host, INTERNET_DEFAULT_HTTPS_PORT, 0) };
+        if (!con.h) return {};
+        WinHttpGuard req{ WinHttpOpenRequest(con.h, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE) };
+        if (!req.h) return {};
+        DWORD redir = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(req.h, WINHTTP_OPTION_REDIRECT_POLICY, &redir, sizeof(redir));
+        if (!WinHttpSendRequest(req.h, L"Accept: application/vnd.github+json\r\n", -1L, nullptr, 0, 0, 0)) return {};
+        if (!WinHttpReceiveResponse(req.h, nullptr)) return {};
+        DWORD status = 0, slen = sizeof(status);
+        WinHttpQueryHeaders(req.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &slen, nullptr);
+        if (status != 200) return {};
+        std::string body;
+        DWORD avail = 0;
+        while (WinHttpQueryDataAvailable(req.h, &avail) && avail > 0) {
+            size_t old = body.size();
+            body.resize(old + avail);
+            DWORD read = 0;
+            if (!WinHttpReadData(req.h, body.data() + old, avail, &read)) break;
+            body.resize(old + read);
+        }
+        return body;
+    }
+
+    inline std::wstring ExtractJsonString(const std::string& json, const char* key) {
+        std::string pat = std::string("\"") + key + "\"";
+        size_t k = json.find(pat);
+        if (k == std::string::npos) return {};
+        size_t col = json.find(':', k + pat.size());
+        if (col == std::string::npos) return {};
+        size_t q1 = json.find('"', col + 1);
+        if (q1 == std::string::npos) return {};
+        size_t q2 = json.find('"', q1 + 1);
+        if (q2 == std::string::npos) return {};
+        std::string val = json.substr(q1 + 1, q2 - q1 - 1);
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, val.c_str(), static_cast<int>(val.size()), nullptr, 0);
+        std::wstring w(wlen, L'\0');
+        MultiByteToWideChar(CP_UTF8, 0, val.c_str(), static_cast<int>(val.size()), w.data(), wlen);
+        return w;
+    }
+
+    inline bool DownloadUrlToFile(const std::wstring& url, const std::wstring& destPath) {
+        URL_COMPONENTSW uc{};
+        uc.dwStructSize = sizeof(uc);
+        wchar_t host[256]{}, path[2048]{};
+        uc.lpszHostName = host; uc.dwHostNameLength = 256;
+        uc.lpszUrlPath = path; uc.dwUrlPathLength = 2048;
+        if (!WinHttpCrackUrl(url.c_str(), static_cast<DWORD>(url.size()), 0, &uc)) return false;
+
+        WinHttpGuard ses{ WinHttpOpen(L"HyperTree-Updater/1.2", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, nullptr, nullptr, 0) };
+        if (!ses.h) return false;
+        WinHttpGuard con{ WinHttpConnect(ses.h, host, uc.nPort, 0) };
+        if (!con.h) return false;
+        DWORD flags = (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0;
+        WinHttpGuard req{ WinHttpOpenRequest(con.h, L"GET", path, nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES, flags) };
+        if (!req.h) return false;
+        DWORD redir = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+        WinHttpSetOption(req.h, WINHTTP_OPTION_REDIRECT_POLICY, &redir, sizeof(redir));
+        if (!WinHttpSendRequest(req.h, WINHTTP_NO_ADDITIONAL_HEADERS, 0, nullptr, 0, 0, 0)) return false;
+        if (!WinHttpReceiveResponse(req.h, nullptr)) return false;
+        DWORD status = 0, slen = sizeof(status);
+        WinHttpQueryHeaders(req.h, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, nullptr, &status, &slen, nullptr);
+        if (status != 200) return false;
+
+        HANDLE hf = CreateFileW(destPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hf == INVALID_HANDLE_VALUE) return false;
+        std::vector<uint8_t> buf(65536);
+        DWORD total = 0;
+        bool firstChunk = true;
+        bool validMz = false;
+        while (true) {
+            DWORD read = 0;
+            if (!WinHttpReadData(req.h, buf.data(), static_cast<DWORD>(buf.size()), &read) || read == 0) break;
+            if (firstChunk) {
+                firstChunk = false;
+                validMz = (read >= 2 && buf[0] == 'M' && buf[1] == 'Z');
+                if (!validMz) { CloseHandle(hf); DeleteFileW(destPath.c_str()); return false; }
+            }
+            DWORD written = 0;
+            if (!WriteFile(hf, buf.data(), read, &written, nullptr)) { CloseHandle(hf); DeleteFileW(destPath.c_str()); return false; }
+            total += written;
+        }
+        CloseHandle(hf);
+        if (!validMz || total < 65536) { DeleteFileW(destPath.c_str()); return false; }
+        return true;
+    }
+
+    inline void CheckAsync(HWND hwnd) {
+        std::thread([hwnd]() {
+            std::string json = HttpGetText(L"api.github.com", L"/repos/ddccdcdc/HyperTree/releases/latest");
+            if (json.empty()) return;
+            std::wstring tag = ExtractJsonString(json, "tag_name");
+            std::wstring url = ExtractJsonString(json, "browser_download_url");
+            if (tag.empty() || url.empty()) return;
+            if (IsNewerVersion(tag, APP_VERSION)) {
+                {
+                    std::lock_guard<std::mutex> lk(g_app.updateMtx);
+                    g_app.updateVersion = tag;
+                    g_app.updateUrl = url;
+                    g_app.updateAvailable = true;
+                }
+                PostMessageW(hwnd, WM_UPDATE_AVAIL, 0, 0);
+            }
+        }).detach();
+    }
+
+    inline void InstallAsync(HWND hwnd) {
+        if (g_app.updating.exchange(true)) return;
+        std::wstring url;
+        {
+            std::lock_guard<std::mutex> lk(g_app.updateMtx);
+            url = g_app.updateUrl;
+        }
+        if (url.empty()) { g_app.updating.store(false); return; }
+        EnableWindow(g_app.btnUpdate, FALSE);
+        SetWindowTextW(g_app.btnUpdate, L"Updating...");
+
+        std::thread([hwnd, url]() {
+            wchar_t exePath[MAX_PATH]{};
+            GetModuleFileNameW(nullptr, exePath, MAX_PATH);
+            std::wstring curExe(exePath);
+            std::wstring tmpExe = curExe + L".update";
+            bool ok = DownloadUrlToFile(url, tmpExe);
+            if (ok) {
+                std::wstring psCmd =
+                    L"-NoProfile -WindowStyle Hidden -Command \"Start-Sleep -Milliseconds 600; "
+                    L"Move-Item -Force '" + tmpExe + L"' '" + curExe + L"'; "
+                    L"Start-Process '" + curExe + L"'\"";
+                SHELLEXECUTEINFOW sei{ sizeof(sei) };
+                sei.lpVerb = L"open";
+                sei.lpFile = L"powershell.exe";
+                sei.lpParameters = psCmd.c_str();
+                sei.nShow = SW_HIDE;
+                if (ShellExecuteExW(&sei)) {
+                    PostMessageW(hwnd, WM_UPDATE_DONE, 1, 0);
+                    return;
+                }
+            }
+            DeleteFileW(tmpExe.c_str());
+            PostMessageW(hwnd, WM_UPDATE_DONE, 0, 0);
+        }).detach();
+    }
+}
 
 // Dynamic uxtheme.dll dark mode helpers (Windows 10 1903+ / Windows 11)
 namespace DarkThemeApi {
@@ -297,8 +481,8 @@ void ApplyTheme() {
     }
     for (HWND c : { g_app.editSearch, g_app.btnFolder, g_app.btnScan, g_app.btnElevate,
                     g_app.btnExport, g_app.btnLang, g_app.btnTheme, g_app.btnClear,
-                    g_app.btnTmUp, g_app.btnTmRoot, g_app.chkTreemap, g_app.chkSystem,
-                    g_app.progressBar, g_app.statusLbl, g_app.tmLbl, g_app.tabCtrl }) {
+                    g_app.btnTmUp, g_app.btnTmRoot, g_app.btnUpdate, g_app.chkTreemap, g_app.chkSystem,
+                    g_app.progressBar, g_app.statusLbl, g_app.tmLbl, g_app.verLbl, g_app.tabCtrl }) {
         if (c) {
             DarkThemeApi::AllowWindow(c, g_app.darkMode);
             SetWindowTheme(c, g_app.darkMode ? L"DarkMode_Explorer" : L"Explorer", nullptr);
@@ -381,8 +565,8 @@ void ApplyLanguage() {
     for (HWND h : {
         g_app.driveCombo, g_app.btnFolder, g_app.btnScan, g_app.btnElevate,
         g_app.btnExport, g_app.chkTreemap, g_app.chkSystem, g_app.btnLang,
-        g_app.btnTheme, g_app.progressBar, g_app.statusLbl, g_app.tabCtrl,
-        g_app.listTree, g_app.listFiles, g_app.listTypes, g_app.editSearch,
+        g_app.btnTheme, g_app.progressBar, g_app.statusLbl, g_app.verLbl, g_app.btnUpdate,
+        g_app.tabCtrl, g_app.listTree, g_app.listFiles, g_app.listTypes, g_app.editSearch,
         g_app.minSizeCombo, g_app.btnClear, g_app.btnTmUp, g_app.btnTmRoot, g_app.tmLbl
     }) {
         SetWindowRtl(h, L.rtl);
@@ -671,9 +855,18 @@ void LayoutControls() {
 
     y += 32;
 
-    // Row 2: Progress + Status
+    // Row 2: Progress + Status + Version / Update button
     MoveWindow(g_app.progressBar, pad, y + 2, 200, 16, TRUE);
-    MoveWindow(g_app.statusLbl, pad + 210, y + 2, std::max(100, W - pad * 2 - 210), 18, TRUE);
+    int rightUsed = 58;
+    MoveWindow(g_app.verLbl, W - pad - 54, y + 2, 54, 18, TRUE);
+    if (g_app.updateAvailable) {
+        MoveWindow(g_app.btnUpdate, W - pad - 54 - 126, y - 1, 120, 22, TRUE);
+        ShowWindow(g_app.btnUpdate, SW_SHOW);
+        rightUsed += 126;
+    } else {
+        ShowWindow(g_app.btnUpdate, SW_HIDE);
+    }
+    MoveWindow(g_app.statusLbl, pad + 210, y + 2, std::max(100, W - pad * 2 - 210 - rightUsed), 18, TRUE);
     y += 24;
 
     // Split bottom treemap
@@ -1016,6 +1209,11 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.progressBar = mk(PROGRESS_CLASSW, L"", PBS_SMOOTH, IDC_PROGRESS);
             SendMessageW(g_app.progressBar, PBM_SETRANGE, 0, MAKELPARAM(0, 1000));
             g_app.statusLbl = mk(L"STATIC", L"Select a drive or folder and click Scan.", SS_LEFT | SS_NOPREFIX, IDC_STATUS_LBL);
+            std::wstring verTxt = std::wstring(L"v") + APP_VERSION;
+            g_app.verLbl = mk(L"STATIC", verTxt.c_str(), SS_RIGHT | SS_NOPREFIX, IDC_VER_LBL);
+            g_app.btnUpdate = CreateWindowExW(0, L"BUTTON", L"Update", WS_CHILD | BS_PUSHBUTTON,
+                0, 0, 10, 10, hwnd, reinterpret_cast<HMENU>(IDC_BTN_UPDATE), g_app.hInst, nullptr);
+            SendMessageW(g_app.btnUpdate, WM_SETFONT, reinterpret_cast<WPARAM>(g_app.uiFont), TRUE);
 
             g_app.tabCtrl = mk(WC_TABCONTROLW, L"", TCS_TABS, IDC_TABS);
             SetWindowSubclass(g_app.tabCtrl, TabCtrlSubclassProc, 1, 0);
@@ -1069,6 +1267,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             ApplyTheme();
             ApplyLanguage();
             LayoutControls();
+            Updater::CheckAsync(hwnd);
             return 0;
         }
         case WM_SIZE:
@@ -1142,6 +1341,36 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                     FormatBytes(bytes).c_str(),
                     secs);
                 SetWindowTextW(g_app.statusLbl, msgBuf);
+            }
+            return 0;
+        }
+        case WM_UPDATE_AVAIL: {
+            std::wstring ver;
+            {
+                std::lock_guard<std::mutex> lk(g_app.updateMtx);
+                ver = g_app.updateVersion;
+            }
+            if (!ver.empty()) {
+                std::wstring lbl = L"Update " + ver;
+                SetWindowTextW(g_app.btnUpdate, lbl.c_str());
+                LayoutControls();
+            }
+            return 0;
+        }
+        case WM_UPDATE_DONE: {
+            if (wp == 1) {
+                PostMessageW(hwnd, WM_CLOSE, 0, 0);
+            } else {
+                g_app.updating.store(false);
+                std::wstring ver;
+                {
+                    std::lock_guard<std::mutex> lk(g_app.updateMtx);
+                    ver = g_app.updateVersion;
+                }
+                std::wstring lbl = L"Update " + ver;
+                SetWindowTextW(g_app.btnUpdate, lbl.c_str());
+                EnableWindow(g_app.btnUpdate, TRUE);
+                MessageBoxW(hwnd, L"Could not download update automatically. Please check your internet connection.", L"HyperTree", MB_ICONWARNING);
             }
             return 0;
         }
@@ -1287,6 +1516,8 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 if (p != NONE_IDX) SetTreemapRoot(p);
             } else if (id == IDC_BTN_TM_ROOT && g_app.tree) {
                 SetTreemapRoot(g_app.tree->root_idx);
+            } else if (id == IDC_BTN_UPDATE) {
+                Updater::InstallAsync(hwnd);
             }
             return 0;
         }
@@ -1335,11 +1566,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                             RebuildFlatRows();
                         } else {
                             InvalidateRect(g_app.listTree, nullptr, FALSE);
-                            if (!g_app.tree->nodes[row.node_idx].is_dir()) {
-                                POINT pt = ia->ptAction;
-                                ClientToScreen(g_app.listTree, &pt);
-                                ShowNodeContextMenu(row.node_idx, pt.x, pt.y);
-                            }
                         }
                     }
                     return 0;
@@ -1390,9 +1616,6 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                         uint32_t idx = g_app.filteredFiles[ia->iItem];
                         g_app.selectedNode = idx;
                         g_app.treemap.SetSelected(idx);
-                        POINT pt = ia->ptAction;
-                        ClientToScreen(g_app.listFiles, &pt);
-                        ShowNodeContextMenu(idx, pt.x, pt.y);
                     }
                     return 0;
                 } else if (nm->code == NM_DBLCLK) {
