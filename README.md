@@ -27,8 +27,8 @@
 ## Key Highlights
 
 - **Dual-Engine Extreme Scanning & Sub-Second `HyperCache`**
-  - **Tier 1 — Overlapped Raw NTFS `$MFT` + `HyperCache + USN Sync` (Administrator Mode)**: Streams `$MFT` extents via a double-buffered overlapped **16 MB** async I/O ring (`FSCTL_GET_NTFS_VOLUME_DATA` + `FSCTL_GET_RETRIEVAL_POINTERS` with `FSCTL_GET_NTFS_FILE_RECORD` fallback) and parses MFT records in parallel across all CPU cores. Repeat scans synchronize only deltas via the live **NTFS USN Change Journal** (`FSCTL_READ_USN_JOURNAL`) for near-instant updates.
-  - **Tier 2 — Native `NtOpenFile` + `NtQueryDirectoryFile` + `HyperCache Instant` (Standard / Non-Admin Mode)**: Launches instantly without a UAC prompt (`asInvoker`), scans full cold NTFS/non-NTFS drives and folders using parallel relative-handle `NtOpenFile` + `NtQueryDirectoryFile` (`FileIdFullDirectoryInformation`, class `38`) with `FindFirstFileExW` fallback (`11.49s` on `C:\Windows`; `~68.5s` cold across `4.24M` files + `771K` folders), and reloads on repeat scans via **`HyperCache Instant` in `0.68s`** (auto-invalidated on in-app deletes; hold `Shift` on **Scan** or choose **Filters → Force Full Rescan** to bypass cache).
+  - **Tier 1 — Overlapped Raw NTFS `$MFT` + `HyperCache + USN Sync` (Administrator Mode)**: Streams `$MFT` extents via a double-buffered overlapped **16 MB** async I/O ring (`FSCTL_GET_NTFS_VOLUME_DATA` + `FSCTL_GET_RETRIEVAL_POINTERS` with `FSCTL_GET_NTFS_FILE_RECORD` fallback) and parses MFT records in parallel across all CPU cores. Repeat drive **and** folder scans synchronize only deltas via the live **NTFS USN Change Journal** (`FSCTL_READ_USN_JOURNAL`) + instant subtree extraction.
+  - **Tier 2 — Native `NtOpenFile` + `NtQueryDirectoryFile` + `HyperCache Instant` (Standard / Non-Admin Mode)**: Launches instantly without a UAC prompt (`asInvoker`), scans drives and folders via parallel `NtOpenFile` + `NtQueryDirectoryFile` (`FileIdFullDirectoryInformation`, class `38`) with `FindFirstFileExW` fallback (`12.7s` cold on `C:\Windows`; `~68.5s` cold across `4.24M` files + `771K` folders), and reloads drives in **`0.68s`** and folders like `C:\Windows` in **`0.066s`** via **`HyperCache Instant`** + drive-cache subtree extraction (hold `Shift` on **Scan** or choose **Filters → Force Full Rescan** to bypass cache).
 - **True On-Disk Allocated Space Accuracy**
   - **Hard-Link Deduplication (`WinSxS` / `System32`)**: Deduplicates 64-bit NTFS `FileId`s across both `$MFT` and standard modes with contiguous open-addressed `FlatFileIdSet` hashing so hard-linked system files are never double-counted.
   - **OneDrive Files On-Demand & Sparse Files**: Detects `FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS` / `FILE_ATTRIBUTE_RECALL_ON_OPEN` cloud placeholders and sparse/compressed files, weighting the treemap, folder sorting, and `% Parent` bars by **actual allocated disk usage** so cloud-only placeholders (`0 B` allocated) never skew your disk map.
@@ -51,7 +51,7 @@
 
 ## Quick Start
 
-1. Click the **Download `hypertree.exe`** button above (single standalone executable, ~496 KB, no installer required).
+1. Click the **Download `hypertree.exe`** button above (single standalone executable, ~504 KB, no installer required).
 2. Run `hypertree.exe`—it opens immediately in standard mode without requiring Administrator privileges (`asInvoker`).
 3. *(Optional)* Click **Elevate (MFT Mode)** in the toolbar at any time to relaunch as Administrator for raw NTFS `$MFT` + live USN Journal scanning (including locked system folders such as `System Volume Information` and `WindowsApps`).
 4. Choose a drive or folder (or pass a folder path via CLI: `hypertree.exe "D:\Projects"`) and click **Scan** (`F5`). Hold `Shift` while clicking **Scan** (or use **Filters → Force Full Rescan**) to bypass `HyperCache`.

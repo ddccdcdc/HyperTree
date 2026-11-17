@@ -1038,7 +1038,7 @@ void ShowNodeContextMenu(uint32_t nodeIdx, int screenX, int screenY) {
                 if (MoveToRecycleBin(path)) {
                     g_app.tree->nodes[nodeIdx].size = 0;
                     g_app.tree->nodes[nodeIdx].allocated = 0;
-                    if (!path.empty()) InvalidateStdHyperCache(path[0]);
+                    if (!path.empty()) InvalidateStdHyperCache(path[0], g_app.tree->root_path);
                     g_app.treemap.SetData(g_app.tree.get(), g_app.treemapRoot, g_app.selectedNode);
                     RebuildFlatRows();
                     RebuildFileFilter();
@@ -1052,7 +1052,7 @@ void ShowNodeContextMenu(uint32_t nodeIdx, int screenX, int screenY) {
                 if (DeletePermanently(path)) {
                     g_app.tree->nodes[nodeIdx].size = 0;
                     g_app.tree->nodes[nodeIdx].allocated = 0;
-                    if (!path.empty()) InvalidateStdHyperCache(path[0]);
+                    if (!path.empty()) InvalidateStdHyperCache(path[0], g_app.tree->root_path);
                     g_app.treemap.SetData(g_app.tree.get(), g_app.treemapRoot, g_app.selectedNode);
                     RebuildFlatRows();
                     RebuildFileFilter();

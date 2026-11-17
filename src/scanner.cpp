@@ -1307,19 +1307,41 @@ std::unique_ptr<DiskTree> TrySyncHyperCacheUsn(
     return tree;
 }
 
-inline std::wstring GetStdCachePath(wchar_t driveLetter) {
+inline std::wstring GetHyperCacheDir() {
     wchar_t appData[MAX_PATH]{};
     DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", appData, MAX_PATH);
     std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(appData) + L"\\HyperTree" : L".";
     CreateDirectoryW(dir.c_str(), nullptr);
-    wchar_t fn[32];
-    swprintf_s(fn, L"\\cache_%c_std.htc", static_cast<wchar_t>(towupper(driveLetter)));
-    return dir + fn;
+    return dir;
 }
 
-void SaveStdHyperCache(wchar_t driveLetter, const DiskTree& tree) {
+inline std::wstring GetStdCachePath(wchar_t driveLetter) {
+    wchar_t fn[32];
+    swprintf_s(fn, L"\\cache_%c_std.htc", static_cast<wchar_t>(towupper(driveLetter)));
+    return GetHyperCacheDir() + fn;
+}
+
+inline std::wstring NormalizeScanRoot(std::wstring p) {
+    while (p.size() > 3 && p.back() == L'\\') p.pop_back();
+    if (p.size() == 2 && p[1] == L':') p.push_back(L'\\');
+    return p;
+}
+
+inline std::wstring GetFolderStdCachePath(const std::wstring& folderPath) {
+    std::wstring norm = NormalizeScanRoot(folderPath);
+    uint64_t h = 14695981039346656037ULL;
+    for (wchar_t c : norm) {
+        wchar_t lc = FastToLower(c);
+        h ^= static_cast<uint64_t>(lc);
+        h *= 1099511628211ULL;
+    }
+    wchar_t fn[48];
+    swprintf_s(fn, L"\\cache_fld_%016llx.htc", static_cast<unsigned long long>(h));
+    return GetHyperCacheDir() + fn;
+}
+
+void SaveStdCacheToPath(const std::wstring& path, wchar_t driveLetter, const DiskTree& tree) {
     if (tree.nodes.empty()) return;
-    std::wstring path = GetStdCachePath(driveLetter);
     std::wstring tmpPath = path + L".tmp";
     HandleGuard hf;
     hf.h = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -1329,7 +1351,7 @@ void SaveStdHyperCache(wchar_t driveLetter, const DiskTree& tree) {
     hdr.magic = HYPERCACHE_MAGIC;
     hdr.version = 2;
     hdr.root_idx = tree.root_idx;
-    hdr.drive_letter = static_cast<wchar_t>(towupper(driveLetter));
+    hdr.drive_letter = driveLetter ? static_cast<wchar_t>(towupper(driveLetter)) : L'_';
     hdr.node_count = tree.nodes.size();
     hdr.name_chars = tree.names.size();
     hdr.ext_count = tree.extensions.size();
@@ -1363,12 +1385,16 @@ void SaveStdHyperCache(wchar_t driveLetter, const DiskTree& tree) {
     else DeleteFileW(tmpPath.c_str());
 }
 
-std::unique_ptr<DiskTree> TryLoadStdHyperCache(
-    wchar_t driveLetter,
+void SaveStdHyperCache(wchar_t driveLetter, const DiskTree& tree) {
+    SaveStdCacheToPath(GetStdCachePath(driveLetter), driveLetter, tree);
+}
+
+std::unique_ptr<DiskTree> TryLoadStdCacheFromPath(
+    const std::wstring& path,
+    const std::wstring& rootPath,
     ScanProgress& progress,
     std::chrono::steady_clock::time_point startTime)
 {
-    std::wstring path = GetStdCachePath(driveLetter);
     HandleGuard hf;
     hf.h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
     if (hf.h == INVALID_HANDLE_VALUE) return nullptr;
@@ -1381,8 +1407,6 @@ std::unique_ptr<DiskTree> TryLoadStdHyperCache(
 
     progress.set_phase(ScanPhase::BuildingTree);
     auto tree = std::make_unique<DiskTree>();
-    wchar_t rootPath[8];
-    swprintf_s(rootPath, L"%c:\\", driveLetter);
     tree->root_idx = hdr.root_idx;
     tree->root_path = rootPath;
     tree->scan_mode = ScanMode::HyperCacheInstant;
@@ -1421,6 +1445,16 @@ std::unique_ptr<DiskTree> TryLoadStdHyperCache(
     progress.folders.store(tree->total_folders, std::memory_order_relaxed);
     progress.bytes_processed.store(tree->total_size, std::memory_order_relaxed);
     return tree;
+}
+
+std::unique_ptr<DiskTree> TryLoadStdHyperCache(
+    wchar_t driveLetter,
+    ScanProgress& progress,
+    std::chrono::steady_clock::time_point startTime)
+{
+    wchar_t rootPath[8];
+    swprintf_s(rootPath, L"%c:\\", static_cast<wchar_t>(towupper(driveLetter)));
+    return TryLoadStdCacheFromPath(GetStdCachePath(driveLetter), rootPath, progress, startTime);
 }
 
 // ============================================================================
@@ -1727,8 +1761,15 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
                         }
                     }
 
-                    if (!enumOk && ntPath.rfind(L"\\??\\UNC\\", 0) == 0) {
-                        std::wstring winPath = L"\\\\" + ntPath.substr(8);
+                    if (!enumOk) {
+                        std::wstring winPath;
+                        if (ntPath.rfind(L"\\??\\UNC\\", 0) == 0) {
+                            winPath = L"\\\\" + ntPath.substr(8);
+                        } else if (ntPath.rfind(L"\\??\\", 0) == 0) {
+                            winPath = ntPath.substr(4);
+                        } else {
+                            winPath = ntPath;
+                        }
                         std::wstring pattern = MakeExtendedPattern(winPath);
                         WIN32_FIND_DATAW fd{};
                         HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
@@ -1856,15 +1897,145 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
     return FinalizeTree(std::move(nodes), std::move(names), std::move(interner), 0, cleanRoot, ScanMode::ParallelWin32, startTime, progress, outErr);
 }
 
+std::unique_ptr<DiskTree> ExtractSubtreeFromTree(
+    std::unique_ptr<DiskTree> srcPtr,
+    const std::wstring& cleanTarget,
+    ScanProgress& progress,
+    std::chrono::steady_clock::time_point startTime,
+    std::wstring& outErr)
+{
+    if (!srcPtr || srcPtr->nodes.empty()) return nullptr;
+    const DiskTree& src = *srcPtr;
+
+    std::wstring base = NormalizeScanRoot(src.root_path);
+    while (!base.empty() && base.back() == L'\\') base.pop_back();
+    std::wstring tgt = cleanTarget;
+    while (!tgt.empty() && tgt.back() == L'\\') tgt.pop_back();
+
+    if (tgt.size() < base.size() || _wcsnicmp(tgt.data(), base.data(), base.size()) != 0) {
+        return nullptr;
+    }
+    if (tgt.size() == base.size()) {
+        return srcPtr;
+    }
+    if (tgt[base.size()] != L'\\') return nullptr;
+
+    uint32_t cur = src.root_idx;
+    size_t pos = base.size() + 1;
+    while (pos < tgt.size()) {
+        size_t sep = tgt.find(L'\\', pos);
+        if (sep == std::wstring::npos) sep = tgt.size();
+        std::wstring_view part(tgt.data() + pos, sep - pos);
+        pos = sep + 1;
+        if (part.empty()) continue;
+
+        uint32_t next = NONE_IDX;
+        uint32_t c = src.nodes[cur].first_child;
+        while (c != NONE_IDX && c < src.nodes.size()) {
+            if (src.nodes[c].is_dir()) {
+                auto nm = src.node_name(c);
+                if (nm.size() == part.size() && _wcsnicmp(nm.data(), part.data(), part.size()) == 0) {
+                    next = c;
+                    break;
+                }
+            }
+            c = src.nodes[c].next_sibling;
+        }
+        if (next == NONE_IDX) return nullptr;
+        cur = next;
+    }
+
+    const uint32_t estNodes = std::max<uint32_t>(16u, src.nodes[cur].files + src.nodes[cur].folders + 2u);
+    std::vector<TreeNode> nodes;
+    nodes.reserve(estNodes);
+    std::vector<wchar_t> names;
+    names.reserve(estNodes * 16);
+    ExtInterner interner;
+
+    names.insert(names.end(), cleanTarget.begin(), cleanTarget.end());
+    nodes.push_back(TreeNode{
+        0, 0, src.nodes[cur].modified, NONE_IDX, NONE_IDX, NONE_IDX, 0, 0,
+        0, static_cast<uint16_t>(std::min<size_t>(cleanTarget.size(), 65535)),
+        0, static_cast<uint8_t>(src.nodes[cur].flags | FLAG_IS_DIR)
+    });
+
+    struct StackItem {
+        uint32_t src_idx;
+        uint32_t dst_parent;
+    };
+    std::vector<StackItem> stack;
+    stack.reserve(256);
+    uint32_t c = src.nodes[cur].first_child;
+    while (c != NONE_IDX && c < src.nodes.size()) {
+        stack.push_back(StackItem{ c, 0 });
+        c = src.nodes[c].next_sibling;
+    }
+
+    uint64_t lf = 0, ld = 0, lb = 0;
+    while (!stack.empty()) {
+        auto item = stack.back();
+        stack.pop_back();
+        if (progress.is_cancelled()) {
+            outErr = L"Scan cancelled.";
+            return nullptr;
+        }
+        const auto& sn = src.nodes[item.src_idx];
+        auto nm = src.node_name(item.src_idx);
+        uint32_t nameOff = static_cast<uint32_t>(names.size());
+        uint16_t nameLen = static_cast<uint16_t>(std::min<size_t>(nm.size(), 65535));
+        names.insert(names.end(), nm.begin(), nm.begin() + nameLen);
+
+        bool isDir = sn.is_dir();
+        uint16_t extId = isDir ? 0 : interner.intern(nm);
+        uint32_t dstIdx = static_cast<uint32_t>(nodes.size());
+        nodes.push_back(TreeNode{
+            isDir ? 0 : sn.size,
+            isDir ? 0 : sn.allocated,
+            sn.modified,
+            item.dst_parent,
+            NONE_IDX, NONE_IDX, 0, 0,
+            nameOff, nameLen, extId, sn.flags
+        });
+
+        if (isDir) {
+            ++ld;
+            uint32_t ch = sn.first_child;
+            while (ch != NONE_IDX && ch < src.nodes.size()) {
+                stack.push_back(StackItem{ ch, dstIdx });
+                ch = src.nodes[ch].next_sibling;
+            }
+        } else {
+            ++lf;
+            lb += sn.size;
+        }
+    }
+    progress.files.store(lf, std::memory_order_relaxed);
+    progress.folders.store(ld, std::memory_order_relaxed);
+    progress.bytes_processed.store(lb, std::memory_order_relaxed);
+
+    return FinalizeTree(std::move(nodes), std::move(names), std::move(interner), 0, cleanTarget, src.scan_mode, startTime, progress, outErr);
+}
+
 } // namespace
 
-void InvalidateStdHyperCache(wchar_t driveLetter) {
-    DeleteFileW(GetStdCachePath(driveLetter).c_str());
+void InvalidateStdHyperCache(wchar_t driveLetter, const std::wstring& rootPath) {
+    if (driveLetter) DeleteFileW(GetStdCachePath(driveLetter).c_str());
+    if (!rootPath.empty()) DeleteFileW(GetFolderStdCachePath(rootPath).c_str());
 }
 
 ScanResult ScanDriveOrFolder(const std::wstring& targetPath, bool isDrive, wchar_t driveLetter, ScanProgress& progress, bool forceFull) {
     auto startTime = std::chrono::steady_clock::now();
     ScanResult res;
+
+    std::wstring cleanTarget = isDrive ? L"" : NormalizeScanRoot(targetPath);
+    if (!isDrive && cleanTarget.size() == 3 && cleanTarget[1] == L':' && cleanTarget[2] == L'\\') {
+        isDrive = true;
+        driveLetter = static_cast<wchar_t>(towupper(cleanTarget[0]));
+    }
+    if (!isDrive && cleanTarget.size() >= 3 && cleanTarget[1] == L':' && cleanTarget[2] == L'\\') {
+        driveLetter = static_cast<wchar_t>(towupper(cleanTarget[0]));
+    }
+
     if (isDrive) {
         if (!forceFull) {
             res.tree = TrySyncHyperCacheUsn(driveLetter, progress, startTime, res.error);
@@ -1875,7 +2046,6 @@ ScanResult ScanDriveOrFolder(const std::wstring& targetPath, bool isDrive, wchar
         if (res.tree || progress.is_cancelled()) return res;
         res.error.clear();
 
-        // Non-admin fallback: try HyperCache Instant snapshot first (< 0.5s), else full NtOpenFile walk
         if (!forceFull) {
             res.tree = TryLoadStdHyperCache(driveLetter, progress, startTime);
             if (res.tree || progress.is_cancelled()) return res;
@@ -1887,8 +2057,52 @@ ScanResult ScanDriveOrFolder(const std::wstring& targetPath, bool isDrive, wchar
             SaveStdHyperCache(driveLetter, *res.tree);
         }
         return res;
-    } else {
-        res.tree = ScanParallelWin32(targetPath, progress, startTime, res.error);
-        return res;
     }
+
+    // Specific folder path: use identical high-speed engines (USN Sync / $MFT / HyperCache Instant -> parallel NtOpenFile)
+    if (driveLetter != 0) {
+        if (!forceFull) {
+            auto driveTree = TrySyncHyperCacheUsn(driveLetter, progress, startTime, res.error);
+            if (progress.is_cancelled()) return res;
+            if (driveTree) {
+                res.tree = ExtractSubtreeFromTree(std::move(driveTree), cleanTarget, progress, startTime, res.error);
+                if (res.tree || progress.is_cancelled()) return res;
+            }
+            res.error.clear();
+        }
+
+        // If elevated on local NTFS, full $MFT + USN warms the volume cache and extracts the exact folder subtree in a few seconds
+        auto mftTree = TryScanNtfsMft(driveLetter, progress, startTime, res.error);
+        if (progress.is_cancelled()) return res;
+        if (mftTree) {
+            res.tree = ExtractSubtreeFromTree(std::move(mftTree), cleanTarget, progress, startTime, res.error);
+            if (res.tree || progress.is_cancelled()) return res;
+        }
+        res.error.clear();
+    }
+
+    // Non-admin (or non-NTFS / network share): folder HyperCache Instant (< 0.2s), else drive HyperCache subtree extraction
+    std::wstring fldCachePath = GetFolderStdCachePath(cleanTarget);
+    if (!forceFull) {
+        res.tree = TryLoadStdCacheFromPath(fldCachePath, cleanTarget, progress, startTime);
+        if (res.tree || progress.is_cancelled()) return res;
+
+        if (driveLetter != 0) {
+            auto driveStdTree = TryLoadStdHyperCache(driveLetter, progress, startTime);
+            if (progress.is_cancelled()) return res;
+            if (driveStdTree) {
+                res.tree = ExtractSubtreeFromTree(std::move(driveStdTree), cleanTarget, progress, startTime, res.error);
+                if (res.tree) {
+                    SaveStdCacheToPath(fldCachePath, driveLetter, *res.tree);
+                    return res;
+                }
+            }
+        }
+    }
+
+    res.tree = ScanParallelWin32(cleanTarget, progress, startTime, res.error);
+    if (res.tree) {
+        SaveStdCacheToPath(fldCachePath, driveLetter, *res.tree);
+    }
+    return res;
 }
