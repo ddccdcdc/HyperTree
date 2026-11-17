@@ -19,10 +19,17 @@ constexpr uint8_t FLAG_IS_CLOUD      = 1 << 4;
 enum class ScanMode : uint8_t {
     NtfsMft = 0,
     ParallelWin32 = 1,
+    HyperCacheUsn = 2,
+    HyperCacheInstant = 3,
 };
 
 inline const wchar_t* ScanModeLabel(ScanMode m) {
-    return m == ScanMode::NtfsMft ? L"Raw NTFS $MFT" : L"Parallel Win32";
+    switch (m) {
+        case ScanMode::NtfsMft:           return L"Raw NTFS $MFT";
+        case ScanMode::HyperCacheUsn:     return L"HyperCache + USN Sync";
+        case ScanMode::HyperCacheInstant: return L"HyperCache Instant (Shift+Scan = Full)";
+        default:                          return L"Parallel NtOpen";
+    }
 }
 
 struct TreeNode {

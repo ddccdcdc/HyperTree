@@ -1,5 +1,6 @@
 #pragma once
 #include "model.h"
+#include "filters.h"
 #include <d2d1.h>
 #include <dwrite.h>
 #include <vector>
@@ -19,7 +20,7 @@ public:
     void Resize(int x, int y, int w, int h);
     void SetData(const DiskTree* tree, uint32_t rootIdx, uint32_t selectedIdx);
     void SetSelected(uint32_t selectedIdx);
-    void SetHideSystem(bool hide);
+    void SetFilters(const VisibilityFilter& f);
     void SetRtl(bool rtl);
     void SetDarkMode(bool dark);
     void Invalidate();
@@ -34,7 +35,7 @@ private:
     uint32_t selected_idx = NONE_IDX;
     uint32_t hovered_idx = NONE_IDX;
     bool layout_dirty = true;
-    bool hide_system = true;
+    VisibilityFilter filters;
     bool is_rtl = false;
     bool dark_mode = true;
     std::vector<TreemapTile> tiles;

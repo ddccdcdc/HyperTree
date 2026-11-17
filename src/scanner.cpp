@@ -1,4 +1,5 @@
 #include "scanner.h"
+#include "filters.h"
 #include "win_utils.h"
 #include <winioctl.h>
 #include <thread>
@@ -111,11 +112,18 @@ std::unique_ptr<DiskTree> FinalizeTree(
         }
     }
 
-    // Bottom-up size & count accumulation
+    // Bottom-up size & count accumulation + collect multi-child dirs for sorting
+    std::vector<uint32_t> sortDirs;
+    sortDirs.reserve(n / 8 + 16);
     for (auto it = order.rbegin(); it != order.rend(); ++it) {
         uint32_t idx = *it;
         const TreeNode& node = nodes[idx];
-        if (!node.is_dir()) {
+        if (node.is_dir()) {
+            uint32_t c = node.first_child;
+            if (c != NONE_IDX && nodes[c].next_sibling != NONE_IDX) {
+                sortDirs.push_back(idx);
+            }
+        } else {
             if (node.ext_id < interner.stats.size()) {
                 auto& st = interner.stats[node.ext_id];
                 st.size += node.size;
@@ -141,10 +149,9 @@ std::unique_ptr<DiskTree> FinalizeTree(
     }
     progress.set_phase(ScanPhase::Sorting);
 
-    // Sort children of every directory in parallel by size descending
-    std::for_each(std::execution::par, order.begin(), order.end(), [&](uint32_t idx) {
+    // Sort children of multi-child directories in parallel by allocated size descending
+    std::for_each(std::execution::par, sortDirs.begin(), sortDirs.end(), [&](uint32_t idx) {
         TreeNode& node = nodes[idx];
-        if (!node.is_dir() || node.first_child == NONE_IDX) return;
         thread_local std::vector<uint32_t> childBuf;
         childBuf.clear();
         uint32_t c = node.first_child;
@@ -152,18 +159,16 @@ std::unique_ptr<DiskTree> FinalizeTree(
             childBuf.push_back(c);
             c = nodes[c].next_sibling;
         }
-        if (childBuf.size() > 1) {
-            std::sort(childBuf.begin(), childBuf.end(), [&](uint32_t a, uint32_t b) {
-                if (nodes[a].allocated != nodes[b].allocated) return nodes[a].allocated > nodes[b].allocated;
-                if (nodes[a].size != nodes[b].size) return nodes[a].size > nodes[b].size;
-                return nodes[a].is_dir() > nodes[b].is_dir();
-            });
-            node.first_child = childBuf[0];
-            for (size_t k = 0; k + 1 < childBuf.size(); ++k) {
-                nodes[childBuf[k]].next_sibling = childBuf[k + 1];
-            }
-            nodes[childBuf.back()].next_sibling = NONE_IDX;
+        std::sort(childBuf.begin(), childBuf.end(), [&](uint32_t a, uint32_t b) {
+            if (nodes[a].allocated != nodes[b].allocated) return nodes[a].allocated > nodes[b].allocated;
+            if (nodes[a].size != nodes[b].size) return nodes[a].size > nodes[b].size;
+            return nodes[a].is_dir() > nodes[b].is_dir();
+        });
+        node.first_child = childBuf[0];
+        for (size_t k = 0; k + 1 < childBuf.size(); ++k) {
+            nodes[childBuf[k]].next_sibling = childBuf[k + 1];
         }
+        nodes[childBuf.back()].next_sibling = NONE_IDX;
     });
 
     // Collect all reachable files and sort largest files first in parallel
@@ -322,6 +327,13 @@ std::vector<MftExtent> GetMftExtentsFromRecordZero(HANDLE volHandle, size_t reco
     return extents;
 }
 
+void SaveHyperCacheSync(
+    wchar_t driveLetter, uint64_t journalId, int64_t nextUsn, uint32_t rootIdx,
+    const std::vector<TreeNode>& nodes, const std::vector<wchar_t>& names,
+    const std::vector<ExtStat>& exts, const std::vector<uint32_t>& topFiles,
+    const std::vector<uint64_t>& nodeFrns,
+    uint64_t totalFiles, uint64_t totalFolders, uint64_t totalSize, uint64_t totalAllocated);
+
 std::unique_ptr<DiskTree> TryScanNtfsMft(
     wchar_t driveLetter,
     ScanProgress& progress,
@@ -334,22 +346,43 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
     wchar_t volPath[16];
     swprintf_s(volPath, L"\\\\.\\%c:", driveLetter);
 
+    // Open raw volume with OVERLAPPED + NO_BUFFERING for concurrent NVMe DMA reads
     HandleGuard volGuard;
     volGuard.h = CreateFileW(
         volPath, GENERIC_READ,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING, nullptr);
+        nullptr, OPEN_EXISTING, FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED, nullptr);
     if (volGuard.h == INVALID_HANDLE_VALUE) {
         outErr = L"Cannot open raw volume.";
         return nullptr;
     }
 
+    // Also open a synchronous handle for fast FSCTL / record queries
+    HandleGuard volSync;
+    volSync.h = CreateFileW(
+        volPath, GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE fsctlVol = (volSync.h != INVALID_HANDLE_VALUE) ? volSync.h : volGuard.h;
+
     NTFS_VOLUME_DATA_BUFFER volData{};
     DWORD bytesRet = 0;
-    if (!DeviceIoControl(volGuard.h, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0,
+    if (!DeviceIoControl(fsctlVol, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0,
         &volData, sizeof(volData), &bytesRet, nullptr)) {
         outErr = L"Volume is not NTFS.";
         return nullptr;
+    }
+
+    // Snapshot USN Journal cursor before scanning $MFT so subsequent incremental sync catches all changes
+    uint64_t snapJournalId = 0;
+    USN snapNextUsn = 0;
+    {
+        USN_JOURNAL_DATA_V0 ujd{};
+        DWORD uret = 0;
+        if (DeviceIoControl(fsctlVol, FSCTL_QUERY_USN_JOURNAL, nullptr, 0, &ujd, sizeof(ujd), &uret, nullptr)) {
+            snapJournalId = ujd.UsnJournalID;
+            snapNextUsn = ujd.NextUsn;
+        }
     }
 
     const size_t bytesPerSector = std::max<size_t>(volData.BytesPerSector, 512);
@@ -398,7 +431,7 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
         }
     }
     if (extents.empty()) {
-        extents = GetMftExtentsFromRecordZero(volGuard.h, recordSize);
+        extents = GetMftExtentsFromRecordZero(fsctlVol, recordSize);
     }
 
     if (extents.empty()) {
@@ -595,70 +628,142 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
         });
     }
 
-    // Sequential reader loop on current thread
+    // Pipelined 4-slot asynchronous OVERLAPPED I/O ring on current thread (keeps NVMe queue busy while workers parse)
     uint64_t remainingValid = mftValidBytes;
     uint64_t currentFrn = 0;
     const size_t chunkAligned = (MFT_CHUNK_BYTES / bytesPerSector) * bytesPerSector;
-    std::vector<uint8_t> leftover;
-    leftover.reserve(recordSize);
 
-    for (const auto& ext : extents) {
-        if (remainingValid == 0 || progress.is_cancelled()) break;
-        uint64_t extBytes = std::min<uint64_t>(ext.clusters * bytesPerCluster, remainingValid);
-        if (ext.lcn < 0) {
-            currentFrn += extBytes / recordSize;
-            remainingValid -= extBytes;
-            continue;
-        }
-
-        LARGE_INTEGER offset{};
-        offset.QuadPart = ext.lcn * static_cast<LONGLONG>(bytesPerCluster);
-        if (!SetFilePointerEx(volGuard.h, offset, nullptr, FILE_BEGIN)) break;
-
-        size_t extRem = static_cast<size_t>(extBytes);
-        while (extRem > 0 && !progress.is_cancelled()) {
-            size_t toReadRaw = std::min(extRem, chunkAligned);
-            size_t toRead = ((toReadRaw + bytesPerSector - 1) / bytesPerSector) * bytesPerSector;
-            std::vector<uint8_t> buf(toRead);
-            DWORD actual = 0;
-            if (!ReadFile(volGuard.h, buf.data(), static_cast<DWORD>(toRead), &actual, nullptr) || actual == 0) {
-                break;
+    struct ReadJob {
+        uint64_t diskOffset;
+        DWORD toRead;
+        size_t validBytes;
+    };
+    std::vector<ReadJob> jobs;
+    std::vector<std::pair<size_t, uint64_t>> sparseSkips; // job index -> records skipped before it
+    {
+        uint64_t rem = mftValidBytes;
+        for (const auto& ext : extents) {
+            if (rem == 0) break;
+            uint64_t extBytes = std::min<uint64_t>(ext.clusters * bytesPerCluster, rem);
+            if (ext.lcn < 0) {
+                sparseSkips.emplace_back(jobs.size(), extBytes / recordSize);
+                rem -= extBytes;
+                continue;
             }
-            size_t validInBuf = std::min<size_t>(actual, extRem);
-            buf.resize(validInBuf);
-            progress.mft_bytes_read.fetch_add(validInBuf, std::memory_order_relaxed);
-
-            if (!leftover.empty()) {
-                std::vector<uint8_t> combined;
-                combined.reserve(leftover.size() + buf.size());
-                combined.insert(combined.end(), leftover.begin(), leftover.end());
-                combined.insert(combined.end(), buf.begin(), buf.end());
-                leftover.clear();
-                buf = std::move(combined);
+            uint64_t baseOff = static_cast<uint64_t>(ext.lcn) * bytesPerCluster;
+            size_t extRem = static_cast<size_t>(extBytes);
+            size_t extPos = 0;
+            while (extRem > 0) {
+                size_t raw = std::min(extRem, chunkAligned);
+                DWORD toRead = static_cast<DWORD>(((raw + bytesPerSector - 1) / bytesPerSector) * bytesPerSector);
+                jobs.push_back(ReadJob{ baseOff + extPos, toRead, raw });
+                extPos += raw;
+                extRem -= raw;
             }
-
-            size_t remMod = buf.size() % recordSize;
-            if (remMod != 0) {
-                size_t splitAt = buf.size() - remMod;
-                leftover.assign(buf.begin() + splitAt, buf.end());
-                buf.resize(splitAt);
-            }
-
-            uint64_t numRecs = buf.size() / recordSize;
-            if (numRecs > 0) {
-                MftChunk chunk{ currentFrn, std::move(buf) };
-                currentFrn += numRecs;
-                std::unique_lock<std::mutex> lk(qMtx);
-                qNotFull.wait(lk, [&]() { return queue.size() < 6 || progress.is_cancelled(); });
-                if (progress.is_cancelled()) break;
-                queue.push_back(std::move(chunk));
-                qNotEmpty.notify_one();
-            }
-
-            extRem -= validInBuf;
-            remainingValid -= validInBuf;
+            rem -= extBytes;
         }
     }
+
+    constexpr size_t RING = 4;
+    struct IoSlot {
+        uint8_t* buf = nullptr;
+        OVERLAPPED ov{};
+        HANDLE hEv = nullptr;
+        size_t validBytes = 0;
+        bool pending = false;
+    };
+    IoSlot slots[RING];
+    const size_t slotCap = chunkAligned + bytesPerSector;
+    for (size_t s = 0; s < RING; ++s) {
+        slots[s].buf = static_cast<uint8_t*>(VirtualAlloc(nullptr, slotCap, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+        slots[s].hEv = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    }
+
+    auto issueJob = [&](size_t slotIdx, size_t jobIdx) {
+        auto& sl = slots[slotIdx];
+        const auto& jb = jobs[jobIdx];
+        ResetEvent(sl.hEv);
+        ZeroMemory(&sl.ov, sizeof(sl.ov));
+        sl.ov.Offset = static_cast<DWORD>(jb.diskOffset & 0xFFFFFFFFULL);
+        sl.ov.OffsetHigh = static_cast<DWORD>(jb.diskOffset >> 32);
+        sl.ov.hEvent = sl.hEv;
+        sl.validBytes = jb.validBytes;
+        DWORD dummy = 0;
+        BOOL ok = ReadFile(volGuard.h, sl.buf, jb.toRead, &dummy, &sl.ov);
+        sl.pending = (ok || GetLastError() == ERROR_IO_PENDING);
+    };
+
+    size_t nextSubmit = 0;
+    for (size_t s = 0; s < RING && nextSubmit < jobs.size(); ++s) {
+        issueJob(s, nextSubmit++);
+    }
+
+    std::vector<uint8_t> leftover;
+    leftover.reserve(recordSize);
+    size_t skipCursor = 0;
+
+    for (size_t completeIdx = 0; completeIdx < jobs.size() && !progress.is_cancelled(); ++completeIdx) {
+        while (skipCursor < sparseSkips.size() && sparseSkips[skipCursor].first == completeIdx) {
+            currentFrn += sparseSkips[skipCursor++].second;
+        }
+        size_t s = completeIdx % RING;
+        auto& sl = slots[s];
+        if (!sl.pending) break;
+        DWORD actual = 0;
+        if (!GetOverlappedResult(volGuard.h, &sl.ov, &actual, TRUE) || actual == 0) break;
+
+        size_t validInBuf = std::min<size_t>(actual, sl.validBytes);
+        progress.mft_bytes_read.fetch_add(validInBuf, std::memory_order_relaxed);
+
+        size_t totalChunkBytes = leftover.size() + validInBuf;
+        size_t remMod = totalChunkBytes % recordSize;
+        size_t usableBytes = totalChunkBytes - remMod;
+
+        std::vector<uint8_t> buf(usableBytes);
+        if (!leftover.empty()) {
+            size_t copyFromBuf = std::min(usableBytes, leftover.size());
+            memcpy(buf.data(), leftover.data(), copyFromBuf);
+            if (usableBytes > leftover.size()) {
+                memcpy(buf.data() + leftover.size(), sl.buf, usableBytes - leftover.size());
+            }
+            if (remMod > 0 && validInBuf >= remMod) {
+                leftover.assign(sl.buf + validInBuf - remMod, sl.buf + validInBuf);
+            } else {
+                leftover.clear();
+            }
+        } else {
+            memcpy(buf.data(), sl.buf, usableBytes);
+            if (remMod > 0) {
+                leftover.assign(sl.buf + usableBytes, sl.buf + validInBuf);
+            }
+        }
+
+        // Re-submit slot immediately so NVMe stays 3-4 reads ahead while we enqueue
+        if (nextSubmit < jobs.size() && !progress.is_cancelled()) {
+            issueJob(s, nextSubmit++);
+        }
+
+        uint64_t numRecs = usableBytes / recordSize;
+        if (numRecs > 0) {
+            MftChunk chunk{ currentFrn, std::move(buf) };
+            currentFrn += numRecs;
+            std::unique_lock<std::mutex> lk(qMtx);
+            qNotFull.wait(lk, [&]() { return queue.size() < 6 || progress.is_cancelled(); });
+            if (progress.is_cancelled()) break;
+            queue.push_back(std::move(chunk));
+            qNotEmpty.notify_one();
+        }
+    }
+
+    for (size_t s = 0; s < RING; ++s) {
+        if (slots[s].pending) {
+            DWORD dummy = 0;
+            GetOverlappedResult(volGuard.h, &slots[s].ov, &dummy, TRUE);
+        }
+        if (slots[s].hEv) CloseHandle(slots[s].hEv);
+        if (slots[s].buf) VirtualFree(slots[s].buf, 0, MEM_RELEASE);
+    }
+    (void)remainingValid;
 
     {
         std::lock_guard<std::mutex> lk(qMtx);
@@ -691,8 +796,12 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
     std::vector<uint32_t> frnToIdx(mapLen, NONE_IDX);
     std::vector<uint64_t> parentFrns;
     parentFrns.reserve(totalRecs + 1);
+    std::vector<uint64_t> nodeFrns;
+    nodeFrns.reserve(totalRecs + 1);
 
     for (const auto& wo : workerOutputs) {
+        size_t baseNameOff = names.size();
+        names.insert(names.end(), wo.names.begin(), wo.names.end());
         for (const auto& r : wo.records) {
             uint32_t idx = static_cast<uint32_t>(nodes.size());
             if (r.frn >= frnToIdx.size()) {
@@ -700,8 +809,7 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
             }
             frnToIdx[static_cast<size_t>(r.frn)] = idx;
 
-            uint32_t nameOff = static_cast<uint32_t>(names.size());
-            names.insert(names.end(), wo.names.data() + r.name_off, wo.names.data() + r.name_off + r.name_len);
+            uint32_t nameOff = static_cast<uint32_t>(baseNameOff + r.name_off);
             bool isDir = (r.flags & FLAG_IS_DIR) != 0;
             uint16_t extId = isDir ? 0 : interner.intern(std::wstring_view(names.data() + nameOff, r.name_len));
 
@@ -720,6 +828,7 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
                 r.flags
             });
             parentFrns.push_back(r.parent_frn);
+            nodeFrns.push_back(r.frn);
         }
     }
 
@@ -754,7 +863,564 @@ std::unique_ptr<DiskTree> TryScanNtfsMft(
 
     wchar_t rootPath[8];
     swprintf_s(rootPath, L"%c:\\", driveLetter);
-    return FinalizeTree(std::move(nodes), std::move(names), std::move(interner), rootIdx, rootPath, ScanMode::NtfsMft, startTime, progress, outErr);
+    auto tree = FinalizeTree(std::move(nodes), std::move(names), std::move(interner), rootIdx, rootPath, ScanMode::NtfsMft, startTime, progress, outErr);
+    if (tree && snapJournalId != 0) {
+        SaveHyperCacheSync(driveLetter, snapJournalId, snapNextUsn, tree->root_idx,
+            tree->nodes, tree->names, tree->extensions, tree->top_files, nodeFrns,
+            tree->total_files, tree->total_folders, tree->total_size, tree->total_allocated);
+    }
+    return tree;
+}
+
+// ============================================================================
+// HyperCache Binary Snapshot + Live NTFS USN Journal Sync (< 1s Rescan)
+// ============================================================================
+struct HyperCacheHeader {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t root_idx;
+    wchar_t  drive_letter;
+    uint16_t reserved[3];
+    uint64_t journal_id;
+    int64_t  next_usn;
+    uint64_t node_count;
+    uint64_t name_chars;
+    uint64_t ext_count;
+    uint64_t top_file_count;
+    uint64_t total_files;
+    uint64_t total_folders;
+    uint64_t total_size;
+    uint64_t total_allocated;
+};
+constexpr uint64_t HYPERCACHE_MAGIC = 0x4854434143484533ULL;
+
+inline std::wstring GetHyperCachePath(wchar_t driveLetter) {
+    wchar_t appData[MAX_PATH]{};
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", appData, MAX_PATH);
+    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(appData) + L"\\HyperTree" : L".";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t fn[32];
+    swprintf_s(fn, L"\\cache_%c.htc", static_cast<wchar_t>(towupper(driveLetter)));
+    return dir + fn;
+}
+
+inline bool WriteAllBytes(HANDLE h, const void* data, size_t bytes) {
+    const uint8_t* p = static_cast<const uint8_t*>(data);
+    while (bytes > 0) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes, 64ULL * 1024 * 1024));
+        DWORD wr = 0;
+        if (!WriteFile(h, p, chunk, &wr, nullptr) || wr == 0) return false;
+        p += wr;
+        bytes -= wr;
+    }
+    return true;
+}
+
+inline bool ReadAllBytes(HANDLE h, void* data, size_t bytes) {
+    uint8_t* p = static_cast<uint8_t*>(data);
+    while (bytes > 0) {
+        DWORD chunk = static_cast<DWORD>(std::min<size_t>(bytes, 64ULL * 1024 * 1024));
+        DWORD rd = 0;
+        if (!ReadFile(h, p, chunk, &rd, nullptr) || rd == 0) return false;
+        p += rd;
+        bytes -= rd;
+    }
+    return true;
+}
+
+void SaveHyperCacheSync(
+    wchar_t driveLetter,
+    uint64_t journalId,
+    int64_t nextUsn,
+    uint32_t rootIdx,
+    const std::vector<TreeNode>& nodes,
+    const std::vector<wchar_t>& names,
+    const std::vector<ExtStat>& exts,
+    const std::vector<uint32_t>& topFiles,
+    const std::vector<uint64_t>& nodeFrns,
+    uint64_t totalFiles,
+    uint64_t totalFolders,
+    uint64_t totalSize,
+    uint64_t totalAllocated)
+{
+    if (journalId == 0 || nodes.empty() || nodeFrns.size() != nodes.size()) return;
+    std::wstring path = GetHyperCachePath(driveLetter);
+    std::wstring tmpPath = path + L".tmp";
+    HandleGuard hf;
+    hf.h = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hf.h == INVALID_HANDLE_VALUE) return;
+
+    HyperCacheHeader hdr{};
+    hdr.magic = HYPERCACHE_MAGIC;
+    hdr.version = 1;
+    hdr.root_idx = rootIdx;
+    hdr.drive_letter = static_cast<wchar_t>(towupper(driveLetter));
+    hdr.journal_id = journalId;
+    hdr.next_usn = nextUsn;
+    hdr.node_count = nodes.size();
+    hdr.name_chars = names.size();
+    hdr.ext_count = exts.size();
+    hdr.top_file_count = topFiles.size();
+    hdr.total_files = totalFiles;
+    hdr.total_folders = totalFolders;
+    hdr.total_size = totalSize;
+    hdr.total_allocated = totalAllocated;
+
+    bool ok = WriteAllBytes(hf.h, &hdr, sizeof(hdr));
+    if (ok) ok = WriteAllBytes(hf.h, nodes.data(), nodes.size() * sizeof(TreeNode));
+    if (ok) ok = WriteAllBytes(hf.h, names.data(), names.size() * sizeof(wchar_t));
+    if (ok) ok = WriteAllBytes(hf.h, topFiles.data(), topFiles.size() * sizeof(uint32_t));
+    if (ok) ok = WriteAllBytes(hf.h, nodeFrns.data(), nodeFrns.size() * sizeof(uint64_t));
+    if (ok) {
+        for (const auto& es : exts) {
+            uint32_t slen = static_cast<uint32_t>(es.ext.size());
+            if (!WriteAllBytes(hf.h, &es.size, sizeof(es.size)) ||
+                !WriteAllBytes(hf.h, &es.allocated, sizeof(es.allocated)) ||
+                !WriteAllBytes(hf.h, &es.count, sizeof(es.count)) ||
+                !WriteAllBytes(hf.h, &es.color_rgb, sizeof(es.color_rgb)) ||
+                !WriteAllBytes(hf.h, &slen, sizeof(slen)) ||
+                (slen > 0 && !WriteAllBytes(hf.h, es.ext.data(), slen * sizeof(wchar_t)))) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    CloseHandle(hf.h);
+    hf.h = INVALID_HANDLE_VALUE;
+    if (ok) MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileW(tmpPath.c_str());
+}
+
+// Fast incremental sync from HyperCache + live NTFS USN Journal
+std::unique_ptr<DiskTree> TrySyncHyperCacheUsn(
+    wchar_t driveLetter,
+    ScanProgress& progress,
+    std::chrono::steady_clock::time_point startTime,
+    std::wstring& outErr)
+{
+    EnablePrivilege(SE_BACKUP_NAME);
+    EnablePrivilege(SE_MANAGE_VOLUME_NAME);
+
+    std::wstring path = GetHyperCachePath(driveLetter);
+    HandleGuard hf;
+    hf.h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hf.h == INVALID_HANDLE_VALUE) return nullptr;
+
+    HyperCacheHeader hdr{};
+    if (!ReadAllBytes(hf.h, &hdr, sizeof(hdr))) return nullptr;
+    if (hdr.magic != HYPERCACHE_MAGIC || hdr.version != 1 || hdr.node_count == 0 ||
+        hdr.root_idx >= hdr.node_count || hdr.journal_id == 0) {
+        return nullptr;
+    }
+
+    // Open volume synchronously to check USN journal before heavy reads
+    wchar_t volPath[16];
+    swprintf_s(volPath, L"\\\\.\\%c:", driveLetter);
+    HandleGuard volGuard;
+    volGuard.h = CreateFileW(volPath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (volGuard.h == INVALID_HANDLE_VALUE) return nullptr;
+
+    USN_JOURNAL_DATA_V0 ujd{};
+    DWORD bytesRet = 0;
+    if (!DeviceIoControl(volGuard.h, FSCTL_QUERY_USN_JOURNAL, nullptr, 0, &ujd, sizeof(ujd), &bytesRet, nullptr)) {
+        return nullptr;
+    }
+    if (ujd.UsnJournalID != hdr.journal_id || hdr.next_usn < ujd.LowestValidUsn || hdr.next_usn > ujd.NextUsn) {
+        return nullptr;
+    }
+
+    // Read USN changes since hdr.next_usn
+    std::vector<uint64_t> changedFrns;
+    std::unordered_set<uint64_t> changedSet;
+    USN latestUsn = ujd.NextUsn;
+    if (hdr.next_usn < ujd.NextUsn) {
+        READ_USN_JOURNAL_DATA_V0 rujd{};
+        rujd.StartUsn = hdr.next_usn;
+        rujd.ReasonMask = USN_REASON_DATA_OVERWRITE | USN_REASON_DATA_EXTEND | USN_REASON_DATA_TRUNCATION |
+                          USN_REASON_FILE_CREATE | USN_REASON_FILE_DELETE | USN_REASON_RENAME_NEW_NAME |
+                          USN_REASON_BASIC_INFO_CHANGE;
+        rujd.UsnJournalID = ujd.UsnJournalID;
+        std::vector<uint8_t> usnBuf(256 * 1024);
+        while (rujd.StartUsn < ujd.NextUsn && !progress.is_cancelled()) {
+            DWORD ret = 0;
+            if (!DeviceIoControl(volGuard.h, FSCTL_READ_USN_JOURNAL, &rujd, sizeof(rujd),
+                usnBuf.data(), static_cast<DWORD>(usnBuf.size()), &ret, nullptr) || ret <= sizeof(USN)) {
+                break;
+            }
+            USN nextStart = ReadU64(usnBuf.data());
+            size_t off = sizeof(USN);
+            while (off + sizeof(DWORD) * 2 < ret) {
+                auto* ur = reinterpret_cast<const USN_RECORD_V2*>(usnBuf.data() + off);
+                if (ur->RecordLength == 0 || off + ur->RecordLength > ret) break;
+                uint64_t frn = ur->FileReferenceNumber & 0x0000FFFFFFFFFFFFULL;
+                if (changedSet.insert(frn).second) {
+                    changedFrns.push_back(frn);
+                }
+                if (changedFrns.size() > 25000) {
+                    return nullptr; // Too many changes; fall back to full MFT scan
+                }
+                off += ur->RecordLength;
+            }
+            if (nextStart <= rujd.StartUsn) break;
+            rujd.StartUsn = nextStart;
+            latestUsn = nextStart;
+        }
+    }
+
+    progress.set_phase(ScanPhase::BuildingTree);
+    std::vector<TreeNode> nodes(hdr.node_count);
+    std::vector<wchar_t> names(hdr.name_chars);
+    std::vector<uint32_t> topFiles(hdr.top_file_count);
+    std::vector<uint64_t> nodeFrns(hdr.node_count);
+    std::vector<ExtStat> exts(hdr.ext_count);
+
+    if (!ReadAllBytes(hf.h, nodes.data(), nodes.size() * sizeof(TreeNode)) ||
+        !ReadAllBytes(hf.h, names.data(), names.size() * sizeof(wchar_t)) ||
+        !ReadAllBytes(hf.h, topFiles.data(), topFiles.size() * sizeof(uint32_t)) ||
+        !ReadAllBytes(hf.h, nodeFrns.data(), nodeFrns.size() * sizeof(uint64_t))) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < exts.size(); ++i) {
+        auto& es = exts[i];
+        uint32_t slen = 0;
+        if (!ReadAllBytes(hf.h, &es.size, sizeof(es.size)) ||
+            !ReadAllBytes(hf.h, &es.allocated, sizeof(es.allocated)) ||
+            !ReadAllBytes(hf.h, &es.count, sizeof(es.count)) ||
+            !ReadAllBytes(hf.h, &es.color_rgb, sizeof(es.color_rgb)) ||
+            !ReadAllBytes(hf.h, &slen, sizeof(slen)) || slen > 64) {
+            return nullptr;
+        }
+        es.ext.resize(slen);
+        if (slen > 0 && !ReadAllBytes(hf.h, es.ext.data(), slen * sizeof(wchar_t))) {
+            return nullptr;
+        }
+    }
+
+    wchar_t rootPath[8];
+    swprintf_s(rootPath, L"%c:\\", driveLetter);
+
+    if (changedFrns.empty()) {
+        auto tree = std::make_unique<DiskTree>();
+        tree->root_idx = hdr.root_idx;
+        tree->root_path = rootPath;
+        tree->scan_mode = ScanMode::HyperCacheUsn;
+        tree->total_files = hdr.total_files;
+        tree->total_folders = hdr.total_folders;
+        tree->total_size = hdr.total_size;
+        tree->total_allocated = hdr.total_allocated;
+        tree->nodes = std::move(nodes);
+        tree->names = std::move(names);
+        tree->extensions = std::move(exts);
+        tree->top_files = std::move(topFiles);
+        tree->scan_duration_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+        progress.files.store(tree->total_files, std::memory_order_relaxed);
+        progress.folders.store(tree->total_folders, std::memory_order_relaxed);
+        progress.bytes_processed.store(tree->total_size, std::memory_order_relaxed);
+        return tree;
+    }
+
+    NTFS_VOLUME_DATA_BUFFER volData{};
+    if (!DeviceIoControl(volGuard.h, FSCTL_GET_NTFS_VOLUME_DATA, nullptr, 0, &volData, sizeof(volData), &bytesRet, nullptr)) {
+        return nullptr;
+    }
+    const size_t bytesPerSector = std::max<size_t>(volData.BytesPerSector, 512);
+    const size_t recordSize = std::max<size_t>(volData.BytesPerFileRecordSegment, 1024);
+
+    ExtInterner interner;
+    interner.stats.clear();
+    interner.map.clear();
+    for (size_t i = 0; i < exts.size(); ++i) {
+        interner.stats.push_back(exts[i]);
+        interner.stats.back().size = 0;
+        interner.stats.back().allocated = 0;
+        interner.stats.back().count = 0;
+        std::wstring key = (i == 0 || exts[i].ext.empty() || exts[i].ext[0] != L'.') ? L"" : exts[i].ext.substr(1);
+        interner.map.emplace(std::move(key), static_cast<uint16_t>(i));
+    }
+
+    uint64_t maxFrn = 0;
+    for (uint64_t f : nodeFrns) maxFrn = std::max(maxFrn, f);
+    for (uint64_t f : changedFrns) maxFrn = std::max(maxFrn, f);
+    std::vector<uint32_t> frnToIdx(static_cast<size_t>(maxFrn) + 64, NONE_IDX);
+    for (uint32_t i = 0; i < static_cast<uint32_t>(nodes.size()); ++i) {
+        if (nodeFrns[i] < frnToIdx.size()) frnToIdx[static_cast<size_t>(nodeFrns[i])] = i;
+    }
+
+    for (auto& nd : nodes) {
+        if (nd.is_dir()) {
+            nd.size = 0;
+            nd.allocated = 0;
+            nd.files = 0;
+            nd.folders = 0;
+        }
+    }
+
+    std::vector<uint8_t> recBuf(sizeof(NTFS_FILE_RECORD_OUTPUT_BUFFER) + recordSize + 64);
+    for (uint64_t cfrn : changedFrns) {
+        if (cfrn < 24 && cfrn != NTFS_ROOT_FRN) continue;
+        NTFS_FILE_RECORD_INPUT_BUFFER inBuf{};
+        inBuf.FileReferenceNumber.QuadPart = static_cast<LONGLONG>(cfrn);
+        DWORD outSz = 0;
+        if (!DeviceIoControl(volGuard.h, FSCTL_GET_NTFS_FILE_RECORD, &inBuf, sizeof(inBuf),
+            recBuf.data(), static_cast<DWORD>(recBuf.size()), &outSz, nullptr)) {
+            continue;
+        }
+        auto* outHdr = reinterpret_cast<const NTFS_FILE_RECORD_OUTPUT_BUFFER*>(recBuf.data());
+        if (outHdr->FileRecordLength < recordSize) continue;
+        std::vector<uint8_t> recCopy(outHdr->FileRecordBuffer, outHdr->FileRecordBuffer + recordSize);
+        uint8_t* rec = recCopy.data();
+
+        bool alive = (memcmp(rec, "FILE", 4) == 0) && ((ReadU16(rec + 22) & 0x01) != 0);
+        uint32_t existingIdx = (cfrn < frnToIdx.size()) ? frnToIdx[static_cast<size_t>(cfrn)] : NONE_IDX;
+        if (!alive) {
+            if (existingIdx != NONE_IDX && existingIdx != hdr.root_idx) {
+                nodes[existingIdx].parent = NONE_IDX;
+                nodes[existingIdx].size = 0;
+                nodes[existingIdx].allocated = 0;
+            }
+            continue;
+        }
+
+        uint16_t usaOff = ReadU16(rec + 4);
+        uint16_t usaCnt = ReadU16(rec + 6);
+        if (usaCnt < 2 || static_cast<size_t>(usaOff) + static_cast<size_t>(usaCnt) * 2 > recordSize) continue;
+        uint8_t usn0 = rec[usaOff], usn1 = rec[usaOff + 1];
+        bool fixOk = true;
+        for (uint16_t s = 1; s < usaCnt; ++s) {
+            size_t secEnd = static_cast<size_t>(s) * bytesPerSector;
+            if (secEnd > recordSize) break;
+            if (rec[secEnd - 2] != usn0 || rec[secEnd - 1] != usn1) { fixOk = false; break; }
+            rec[secEnd - 2] = rec[usaOff + s * 2];
+            rec[secEnd - 1] = rec[usaOff + s * 2 + 1];
+        }
+        if (!fixOk) continue;
+
+        uint64_t baseRecord = ReadU64(rec + 32) & 0x0000FFFFFFFFFFFFULL;
+        if (baseRecord != 0) continue;
+        uint16_t recFlags = ReadU16(rec + 22);
+        bool isDir = (recFlags & 0x02) != 0;
+        size_t attrOff = ReadU16(rec + 20);
+        size_t bytesUsed = std::min<size_t>(ReadU32(rec + 24), recordSize);
+        if (attrOff < 42 || attrOff >= bytesUsed) continue;
+
+        int64_t modified = 0;
+        uint32_t stdAttrs = 0;
+        const wchar_t* bestNamePtr = nullptr;
+        uint16_t bestNameLen = 0;
+        uint8_t bestNsRank = 255;
+        uint64_t parentFrn = NTFS_ROOT_FRN;
+        uint64_t fileSize = 0;
+        uint64_t allocSize = 0;
+
+        while (attrOff + 16 <= bytesUsed) {
+            uint32_t attrType = ReadU32(rec + attrOff);
+            if (attrType == 0xFFFFFFFFu) break;
+            uint32_t attrLen = ReadU32(rec + attrOff + 4);
+            if (attrLen < 16 || attrOff + attrLen > bytesUsed) break;
+            uint8_t nonRes = rec[attrOff + 8];
+            uint8_t attrNameLen = rec[attrOff + 9];
+            if (attrType == 0x10 && nonRes == 0) {
+                uint16_t vOff = ReadU16(rec + attrOff + 20);
+                uint32_t vLen = ReadU32(rec + attrOff + 16);
+                size_t abs = attrOff + vOff;
+                if (vLen >= 36 && abs + 36 <= attrOff + attrLen) {
+                    modified = ReadI64(rec + abs + 8);
+                    stdAttrs = ReadU32(rec + abs + 32);
+                }
+            } else if (attrType == 0x30 && nonRes == 0) {
+                uint16_t vOff = ReadU16(rec + attrOff + 20);
+                uint32_t vLen = ReadU32(rec + attrOff + 16);
+                size_t abs = attrOff + vOff;
+                if (vLen >= 66 && abs + 66 <= attrOff + attrLen) {
+                    uint64_t pfrn = ReadU64(rec + abs) & 0x0000FFFFFFFFFFFFULL;
+                    uint8_t nlen = rec[abs + 64];
+                    uint8_t ns = rec[abs + 65];
+                    size_t nbytes = abs + 66;
+                    if (nbytes + static_cast<size_t>(nlen) * 2 <= attrOff + attrLen) {
+                        uint8_t rank = (ns == 1 || ns == 3) ? 0 : (ns == 0 ? 1 : 2);
+                        if (rank < bestNsRank) {
+                            bestNsRank = rank;
+                            bestNamePtr = reinterpret_cast<const wchar_t*>(rec + nbytes);
+                            bestNameLen = nlen;
+                            parentFrn = pfrn;
+                        }
+                    }
+                }
+            } else if (attrType == 0x80 && attrNameLen == 0) {
+                if (nonRes == 0) {
+                    fileSize = ReadU32(rec + attrOff + 16);
+                    allocSize = 0;
+                } else if (attrLen >= 56 && ReadU64(rec + attrOff + 16) == 0) {
+                    uint64_t alloc = ReadU64(rec + attrOff + 40);
+                    uint64_t dsize = ReadU64(rec + attrOff + 48);
+                    uint16_t aflags = ReadU16(rec + attrOff + 12);
+                    if ((aflags & 0x8001) != 0 && attrLen >= 72) alloc = ReadU64(rec + attrOff + 64);
+                    fileSize = dsize;
+                    allocSize = alloc;
+                }
+            }
+            attrOff += attrLen;
+        }
+        if (!bestNamePtr || bestNameLen == 0) continue;
+        if (cfrn < 24 && cfrn != NTFS_ROOT_FRN && bestNamePtr[0] == L'$') continue;
+
+        uint8_t flags = 0;
+        if (isDir) flags |= FLAG_IS_DIR;
+        if (stdAttrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
+        if (stdAttrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
+        if (stdAttrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
+        if (IsCloudPlaceholderAttrs(stdAttrs)) {
+            flags |= FLAG_IS_CLOUD;
+            if (stdAttrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) allocSize = 0;
+        }
+
+        uint32_t parentIdx = (cfrn == hdr.root_idx) ? NONE_IDX : ((parentFrn < frnToIdx.size()) ? frnToIdx[static_cast<size_t>(parentFrn)] : NONE_IDX);
+        uint32_t nameOff = static_cast<uint32_t>(names.size());
+        names.insert(names.end(), bestNamePtr, bestNamePtr + bestNameLen);
+        uint16_t extId = isDir ? 0 : interner.intern(std::wstring_view(names.data() + nameOff, bestNameLen));
+
+        if (existingIdx != NONE_IDX) {
+            nodes[existingIdx] = TreeNode{
+                isDir ? 0 : fileSize, isDir ? 0 : allocSize, modified,
+                parentIdx, NONE_IDX, NONE_IDX, 0, 0,
+                nameOff, bestNameLen, extId, flags
+            };
+        } else {
+            uint32_t newIdx = static_cast<uint32_t>(nodes.size());
+            if (cfrn < frnToIdx.size()) frnToIdx[static_cast<size_t>(cfrn)] = newIdx;
+            nodeFrns.push_back(cfrn);
+            nodes.push_back(TreeNode{
+                isDir ? 0 : fileSize, isDir ? 0 : allocSize, modified,
+                parentIdx, NONE_IDX, NONE_IDX, 0, 0,
+                nameOff, bestNameLen, extId, flags
+            });
+        }
+    }
+
+    auto tree = FinalizeTree(std::move(nodes), std::move(names), std::move(interner), hdr.root_idx, rootPath, ScanMode::HyperCacheUsn, startTime, progress, outErr);
+    if (tree) {
+        SaveHyperCacheSync(driveLetter, ujd.UsnJournalID, latestUsn, tree->root_idx,
+            tree->nodes, tree->names, tree->extensions, tree->top_files, nodeFrns,
+            tree->total_files, tree->total_folders, tree->total_size, tree->total_allocated);
+    }
+    return tree;
+}
+
+inline std::wstring GetStdCachePath(wchar_t driveLetter) {
+    wchar_t appData[MAX_PATH]{};
+    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA", appData, MAX_PATH);
+    std::wstring dir = (n > 0 && n < MAX_PATH) ? std::wstring(appData) + L"\\HyperTree" : L".";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    wchar_t fn[32];
+    swprintf_s(fn, L"\\cache_%c_std.htc", static_cast<wchar_t>(towupper(driveLetter)));
+    return dir + fn;
+}
+
+void SaveStdHyperCache(wchar_t driveLetter, const DiskTree& tree) {
+    if (tree.nodes.empty()) return;
+    std::wstring path = GetStdCachePath(driveLetter);
+    std::wstring tmpPath = path + L".tmp";
+    HandleGuard hf;
+    hf.h = CreateFileW(tmpPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hf.h == INVALID_HANDLE_VALUE) return;
+
+    HyperCacheHeader hdr{};
+    hdr.magic = HYPERCACHE_MAGIC;
+    hdr.version = 2;
+    hdr.root_idx = tree.root_idx;
+    hdr.drive_letter = static_cast<wchar_t>(towupper(driveLetter));
+    hdr.node_count = tree.nodes.size();
+    hdr.name_chars = tree.names.size();
+    hdr.ext_count = tree.extensions.size();
+    hdr.top_file_count = tree.top_files.size();
+    hdr.total_files = tree.total_files;
+    hdr.total_folders = tree.total_folders;
+    hdr.total_size = tree.total_size;
+    hdr.total_allocated = tree.total_allocated;
+
+    bool ok = WriteAllBytes(hf.h, &hdr, sizeof(hdr));
+    if (ok) ok = WriteAllBytes(hf.h, tree.nodes.data(), tree.nodes.size() * sizeof(TreeNode));
+    if (ok) ok = WriteAllBytes(hf.h, tree.names.data(), tree.names.size() * sizeof(wchar_t));
+    if (ok) ok = WriteAllBytes(hf.h, tree.top_files.data(), tree.top_files.size() * sizeof(uint32_t));
+    if (ok) {
+        for (const auto& es : tree.extensions) {
+            uint32_t slen = static_cast<uint32_t>(es.ext.size());
+            if (!WriteAllBytes(hf.h, &es.size, sizeof(es.size)) ||
+                !WriteAllBytes(hf.h, &es.allocated, sizeof(es.allocated)) ||
+                !WriteAllBytes(hf.h, &es.count, sizeof(es.count)) ||
+                !WriteAllBytes(hf.h, &es.color_rgb, sizeof(es.color_rgb)) ||
+                !WriteAllBytes(hf.h, &slen, sizeof(slen)) ||
+                (slen > 0 && !WriteAllBytes(hf.h, es.ext.data(), slen * sizeof(wchar_t)))) {
+                ok = false;
+                break;
+            }
+        }
+    }
+    CloseHandle(hf.h);
+    hf.h = INVALID_HANDLE_VALUE;
+    if (ok) MoveFileExW(tmpPath.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING);
+    else DeleteFileW(tmpPath.c_str());
+}
+
+std::unique_ptr<DiskTree> TryLoadStdHyperCache(
+    wchar_t driveLetter,
+    ScanProgress& progress,
+    std::chrono::steady_clock::time_point startTime)
+{
+    std::wstring path = GetStdCachePath(driveLetter);
+    HandleGuard hf;
+    hf.h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+    if (hf.h == INVALID_HANDLE_VALUE) return nullptr;
+
+    HyperCacheHeader hdr{};
+    if (!ReadAllBytes(hf.h, &hdr, sizeof(hdr))) return nullptr;
+    if (hdr.magic != HYPERCACHE_MAGIC || hdr.version != 2 || hdr.node_count == 0 || hdr.root_idx >= hdr.node_count) {
+        return nullptr;
+    }
+
+    progress.set_phase(ScanPhase::BuildingTree);
+    auto tree = std::make_unique<DiskTree>();
+    wchar_t rootPath[8];
+    swprintf_s(rootPath, L"%c:\\", driveLetter);
+    tree->root_idx = hdr.root_idx;
+    tree->root_path = rootPath;
+    tree->scan_mode = ScanMode::HyperCacheInstant;
+    tree->total_files = hdr.total_files;
+    tree->total_folders = hdr.total_folders;
+    tree->total_size = hdr.total_size;
+    tree->total_allocated = hdr.total_allocated;
+    tree->nodes.resize(hdr.node_count);
+    tree->names.resize(hdr.name_chars);
+    tree->top_files.resize(hdr.top_file_count);
+    tree->extensions.resize(hdr.ext_count);
+
+    if (!ReadAllBytes(hf.h, tree->nodes.data(), tree->nodes.size() * sizeof(TreeNode)) ||
+        !ReadAllBytes(hf.h, tree->names.data(), tree->names.size() * sizeof(wchar_t)) ||
+        !ReadAllBytes(hf.h, tree->top_files.data(), tree->top_files.size() * sizeof(uint32_t))) {
+        return nullptr;
+    }
+    for (size_t i = 0; i < tree->extensions.size(); ++i) {
+        auto& es = tree->extensions[i];
+        uint32_t slen = 0;
+        if (!ReadAllBytes(hf.h, &es.size, sizeof(es.size)) ||
+            !ReadAllBytes(hf.h, &es.allocated, sizeof(es.allocated)) ||
+            !ReadAllBytes(hf.h, &es.count, sizeof(es.count)) ||
+            !ReadAllBytes(hf.h, &es.color_rgb, sizeof(es.color_rgb)) ||
+            !ReadAllBytes(hf.h, &slen, sizeof(slen)) || slen > 64) {
+            return nullptr;
+        }
+        es.ext.resize(slen);
+        if (slen > 0 && !ReadAllBytes(hf.h, es.ext.data(), slen * sizeof(wchar_t))) {
+            return nullptr;
+        }
+    }
+
+    tree->scan_duration_secs = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
+    progress.files.store(tree->total_files, std::memory_order_relaxed);
+    progress.folders.store(tree->total_folders, std::memory_order_relaxed);
+    progress.bytes_processed.store(tree->total_size, std::memory_order_relaxed);
+    return tree;
 }
 
 // ============================================================================
@@ -869,6 +1535,8 @@ using FnNtQueryDirectoryFile = LONG(NTAPI*)(
     PVOID FileName,
     BOOLEAN RestartScan);
 
+using FnNtClose = LONG(NTAPI*)(HANDLE Handle);
+
 inline FnNtOpenFile GetNtOpenFile() {
     static FnNtOpenFile fn = reinterpret_cast<FnNtOpenFile>(
         GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtOpenFile"));
@@ -881,26 +1549,24 @@ inline FnNtQueryDirectoryFile GetNtQueryDir() {
     return fn;
 }
 
-inline bool ContainsInsensitive(std::wstring_view hay, std::wstring_view lowerNeedle) {
-    if (hay.size() < lowerNeedle.size()) return false;
-    size_t limit = hay.size() - lowerNeedle.size();
-    for (size_t i = 0; i <= limit; ++i) {
-        size_t j = 0;
-        while (j < lowerNeedle.size()) {
-            wchar_t c = hay[i + j];
-            if (c >= L'A' && c <= L'Z') c = c - L'A' + L'a';
-            if (c != lowerNeedle[j]) break;
-            ++j;
-        }
-        if (j == lowerNeedle.size()) return true;
-    }
-    return false;
+inline FnNtClose GetNtClose() {
+    static FnNtClose fn = reinterpret_cast<FnNtClose>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtClose"));
+    return fn;
+}
+
+inline std::wstring MakeNtDirPath(const std::wstring& dirPath) {
+    std::wstring clean = dirPath;
+    while (clean.size() > 3 && clean.back() == L'\\') clean.pop_back();
+    if (clean.rfind(L"\\??\\", 0) == 0) return clean;
+    if (clean.rfind(L"\\\\?\\", 0) == 0) return L"\\??\\" + clean.substr(4);
+    if (clean.rfind(L"\\\\", 0) == 0) return L"\\??\\UNC\\" + clean.substr(2);
+    return L"\\??\\" + clean;
 }
 
 inline bool NeedsHardLinkDedup(const std::wstring& dirPath) {
-    return ContainsInsensitive(dirPath, L"winsxs") ||
-           ContainsInsensitive(dirPath, L"system32") ||
-           ContainsInsensitive(dirPath, L"ht_cloud_test");
+    return ContainsCaseInsensitive(dirPath, L"winsxs") ||
+           ContainsCaseInsensitive(dirPath, L"system32");
 }
 
 struct DirEntryRaw {
@@ -935,237 +1601,191 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
     std::mutex qMtx;
     std::condition_variable qCv;
     std::deque<std::pair<uint32_t, std::wstring>> dirQueue;
-    dirQueue.emplace_back(0u, cleanRoot);
-    std::atomic<size_t> queuedCount{ 1 };
-    std::atomic<size_t> activeWorkers{ 0 };
+    dirQueue.emplace_back(0u, MakeNtDirPath(cleanRoot));
+    size_t activeWorkers = 0;
     bool allDone = false;
     std::atomic<uint32_t> nextDirId{ 1 };
 
     const unsigned hw = std::max(4u, std::thread::hardware_concurrency());
     const unsigned numThreads = std::min(32u, std::max(16u, hw * 2));
     std::vector<WorkerWin32Out> workerOuts(numThreads);
-    std::vector<std::wstring> curDirPerWorker(numThreads);
     std::vector<std::thread> threads;
     threads.reserve(numThreads);
     FnNtOpenFile ntOpenFile = GetNtOpenFile();
     FnNtQueryDirectoryFile ntQueryDir = GetNtQueryDir();
+    FnNtClose ntClose = GetNtClose();
 
     for (unsigned t = 0; t < numThreads; ++t) {
         threads.emplace_back([&, t]() {
             auto& out = workerOuts[t];
-            out.entries.reserve(65536);
-            out.names.reserve(65536 * 16);
-            std::vector<uint8_t> smallBuf(8192);
-            std::vector<uint8_t> largeBuf(65536);
+            out.entries.reserve(32768);
+            out.names.reserve(32768 * 16);
+            std::vector<uint8_t> dirBuf(65536);
+            std::vector<std::pair<uint32_t, std::wstring>> batch;
+            batch.reserve(16);
+            std::vector<std::pair<uint32_t, std::wstring>> found;
+            found.reserve(256);
 
-            struct SubDirRef {
-                uint32_t dir_id;
-                uint32_t name_off;
-                uint16_t name_len;
-            };
+            while (true) {
+                batch.clear();
+                {
+                    std::unique_lock<std::mutex> lk(qMtx);
+                    qCv.wait(lk, [&]() { return !dirQueue.empty() || allDone || progress.is_cancelled(); });
+                    if ((dirQueue.empty() && allDone) || progress.is_cancelled()) break;
+                    size_t take = std::min<size_t>(16, (dirQueue.size() + numThreads - 1) / numThreads);
+                    if (take == 0) take = 1;
+                    for (size_t k = 0; k < take && !dirQueue.empty(); ++k) {
+                        batch.push_back(std::move(dirQueue.back()));
+                        dirQueue.pop_back();
+                    }
+                    ++activeWorkers;
+                }
 
-            // Recursive parent-relative directory scanner (zero full-path parsing for deep trees)
-            auto scanDirHandle = [&](auto& self, HANDLE hDir, uint32_t parentDirId, const std::wstring& dirPathIfRoot, int depth) -> void {
-                if (progress.is_cancelled() || depth > 64) return;
-                uint64_t localFiles = 0, localFolders = 0, localBytes = 0;
-                std::vector<SubDirRef> childDirs;
+                found.clear();
+                uint64_t lf = 0, ld = 0, lb = 0;
 
-                IO_STATUS_BLOCK_LOCAL iosb{};
-                uint8_t* curBuf = smallBuf.data();
-                ULONG curBufLen = static_cast<ULONG>(smallBuf.size());
-                LONG st = ntQueryDir(
-                    hDir, nullptr, nullptr, nullptr, &iosb,
-                    curBuf, curBufLen,
-                    38 /*FileIdFullDirectoryInformation*/, FALSE, nullptr, TRUE);
-                while (st >= 0 && !progress.is_cancelled()) {
-                    size_t off = 0;
-                    while (true) {
-                        auto* info = reinterpret_cast<const FILE_ID_FULL_DIR_INFORMATION_LOCAL*>(curBuf + off);
-                        size_t len = info->FileNameLength / sizeof(wchar_t);
-                        const wchar_t* fn = info->FileName;
-                        bool isDot = (len == 1 && fn[0] == L'.') || (len == 2 && fn[0] == L'.' && fn[1] == L'.');
-                        if (!isDot && len > 0) {
-                            DWORD attrs = info->FileAttributes;
-                            bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
-                            bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
-                            if (!(isDir && isReparse)) {
+                for (auto& task : batch) {
+                    if (progress.is_cancelled()) break;
+                    uint32_t parentDirId = task.first;
+                    std::wstring& ntPath = task.second;
+                    std::wstring base = ntPath;
+                    while (base.size() > 7 && base.back() == L'\\') base.pop_back();
+
+                    bool enumOk = false;
+                    if (ntOpenFile && ntQueryDir && ntClose) {
+                        UNICODE_STRING_LOCAL u{};
+                        u.Length = static_cast<USHORT>(ntPath.size() * sizeof(wchar_t));
+                        u.MaximumLength = u.Length;
+                        u.Buffer = ntPath.data();
+                        OBJECT_ATTRIBUTES_LOCAL oa{};
+                        oa.Length = sizeof(oa);
+                        oa.ObjectName = &u;
+                        oa.Attributes = 0x40; // OBJ_CASE_INSENSITIVE
+                        IO_STATUS_BLOCK_LOCAL iosb{};
+                        HANDLE hDir = nullptr;
+                        if (ntOpenFile(&hDir, FILE_LIST_DIRECTORY | SYNCHRONIZE, &oa, &iosb,
+                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                            0x00004000 | 0x00000020 | 0x00000001 /*BACKUP_INTENT | SYNC | DIRECTORY*/) >= 0 && hDir) {
+                            enumOk = true;
+                            LONG st = ntQueryDir(hDir, nullptr, nullptr, nullptr, &iosb,
+                                dirBuf.data(), static_cast<ULONG>(dirBuf.size()),
+                                38 /*FileIdFullDirectoryInformation*/, FALSE, nullptr, TRUE);
+                            while (st >= 0 && !progress.is_cancelled()) {
+                                size_t off = 0;
+                                while (true) {
+                                    auto* info = reinterpret_cast<const FILE_ID_FULL_DIR_INFORMATION_LOCAL*>(dirBuf.data() + off);
+                                    size_t len = info->FileNameLength / sizeof(wchar_t);
+                                    const wchar_t* fn = info->FileName;
+                                    bool isDot = (len == 1 && fn[0] == L'.') || (len == 2 && fn[0] == L'.' && fn[1] == L'.');
+                                    if (!isDot && len > 0) {
+                                        DWORD attrs = info->FileAttributes;
+                                        bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                                        bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                                        if (!(isDir && isReparse)) {
+                                            uint8_t flags = 0;
+                                            uint32_t selfDirId = 0;
+                                            if (isDir) {
+                                                flags |= FLAG_IS_DIR;
+                                                ++ld;
+                                                selfDirId = nextDirId.fetch_add(1, std::memory_order_relaxed);
+                                            }
+                                            if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
+                                            if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
+                                            if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
+                                            if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
+
+                                            uint64_t sz = isDir ? 0 : static_cast<uint64_t>(std::max<LONGLONG>(0, info->EndOfFile.QuadPart));
+                                            uint64_t alloc = (!isDir && sz > 0 && !(attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
+                                                ? static_cast<uint64_t>(std::max<LONGLONG>(0, info->AllocationSize.QuadPart)) : 0;
+                                            int64_t mod = info->LastWriteTime.QuadPart;
+                                            uint64_t fid = static_cast<uint64_t>(info->FileId.QuadPart);
+
+                                            if (!isDir) { ++lf; lb += sz; }
+                                            uint32_t noff = static_cast<uint32_t>(out.names.size());
+                                            uint16_t nlen = static_cast<uint16_t>(std::min<size_t>(len, 65535));
+                                            out.names.insert(out.names.end(), fn, fn + nlen);
+                                            out.entries.push_back(DirEntryRaw{ parentDirId, selfDirId, noff, nlen, sz, alloc, mod, fid, flags });
+
+                                            if (isDir) {
+                                                std::wstring sub;
+                                                sub.reserve(base.size() + 1 + nlen);
+                                                sub.append(base);
+                                                sub.push_back(L'\\');
+                                                sub.append(fn, nlen);
+                                                found.emplace_back(selfDirId, std::move(sub));
+                                            }
+                                        }
+                                    }
+                                    if (info->NextEntryOffset == 0) break;
+                                    off += info->NextEntryOffset;
+                                }
+                                st = ntQueryDir(hDir, nullptr, nullptr, nullptr, &iosb,
+                                    dirBuf.data(), static_cast<ULONG>(dirBuf.size()),
+                                    38 /*FileIdFullDirectoryInformation*/, FALSE, nullptr, FALSE);
+                            }
+                            ntClose(hDir);
+                        }
+                    }
+
+                    if (!enumOk && ntPath.rfind(L"\\??\\UNC\\", 0) == 0) {
+                        std::wstring winPath = L"\\\\" + ntPath.substr(8);
+                        std::wstring pattern = MakeExtendedPattern(winPath);
+                        WIN32_FIND_DATAW fd{};
+                        HANDLE hFind = FindFirstFileExW(pattern.c_str(), FindExInfoBasic, &fd,
+                            FindExSearchNameMatch, nullptr, FIND_FIRST_EX_LARGE_FETCH);
+                        if (hFind != INVALID_HANDLE_VALUE) {
+                            do {
+                                const wchar_t* fn = fd.cFileName;
+                                if (fn[0] == L'.' && (fn[1] == L'\0' || (fn[1] == L'.' && fn[2] == L'\0'))) continue;
+                                DWORD attrs = fd.dwFileAttributes;
+                                bool isDir = (attrs & FILE_ATTRIBUTE_DIRECTORY) != 0;
+                                bool isReparse = (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0;
+                                if (isDir && isReparse) continue;
+                                size_t len = wcslen(fn);
+                                if (len == 0) continue;
                                 uint8_t flags = 0;
                                 uint32_t selfDirId = 0;
                                 if (isDir) {
                                     flags |= FLAG_IS_DIR;
-                                    ++localFolders;
+                                    ++ld;
                                     selfDirId = nextDirId.fetch_add(1, std::memory_order_relaxed);
                                 }
                                 if (attrs & FILE_ATTRIBUTE_HIDDEN) flags |= FLAG_IS_HIDDEN;
                                 if (attrs & FILE_ATTRIBUTE_SYSTEM) flags |= FLAG_IS_SYSTEM;
                                 if (attrs & FILE_ATTRIBUTE_COMPRESSED) flags |= FLAG_IS_COMPRESSED;
                                 if (IsCloudPlaceholderAttrs(attrs)) flags |= FLAG_IS_CLOUD;
-
-                                uint64_t sz = isDir ? 0 : static_cast<uint64_t>(std::max<LONGLONG>(0, info->EndOfFile.QuadPart));
-                                uint64_t alloc = 0;
-                                if (!isDir && sz > 0) {
-                                    if (attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS) {
-                                        alloc = 0;
-                                    } else {
-                                        alloc = static_cast<uint64_t>(std::max<LONGLONG>(0, info->AllocationSize.QuadPart));
-                                    }
-                                }
-                                int64_t mod = info->LastWriteTime.QuadPart;
-                                uint64_t fid = static_cast<uint64_t>(info->FileId.QuadPart);
-
-                                if (!isDir) {
-                                    ++localFiles;
-                                    localBytes += sz;
-                                }
+                                uint64_t sz = isDir ? 0 : ((static_cast<uint64_t>(fd.nFileSizeHigh) << 32) | fd.nFileSizeLow);
+                                uint64_t alloc = (!isDir && sz > 0 && !(attrs & FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS))
+                                    ? (((sz + 4095) / 4096) * 4096) : 0;
+                                int64_t mod = (static_cast<int64_t>(fd.ftLastWriteTime.dwHighDateTime) << 32) | fd.ftLastWriteTime.dwLowDateTime;
+                                if (!isDir) { ++lf; lb += sz; }
                                 uint32_t noff = static_cast<uint32_t>(out.names.size());
                                 uint16_t nlen = static_cast<uint16_t>(std::min<size_t>(len, 65535));
                                 out.names.insert(out.names.end(), fn, fn + nlen);
-                                out.entries.push_back(DirEntryRaw{ parentDirId, selfDirId, noff, nlen, sz, alloc, mod, fid, flags });
-
+                                out.entries.push_back(DirEntryRaw{ parentDirId, selfDirId, noff, nlen, sz, alloc, mod, 0, flags });
                                 if (isDir) {
-                                    childDirs.push_back(SubDirRef{ selfDirId, noff, nlen });
+                                    std::wstring sub = base + L"\\";
+                                    sub.append(fn, nlen);
+                                    found.emplace_back(selfDirId, std::move(sub));
                                 }
-                            }
+                            } while (FindNextFileW(hFind, &fd));
+                            FindClose(hFind);
                         }
-                        if (info->NextEntryOffset == 0) break;
-                        off += info->NextEntryOffset;
-                    }
-                    curBuf = largeBuf.data();
-                    curBufLen = static_cast<ULONG>(largeBuf.size());
-                    st = ntQueryDir(
-                        hDir, nullptr, nullptr, nullptr, &iosb,
-                        curBuf, curBufLen,
-                        38 /*FileIdFullDirectoryInformation*/, FALSE, nullptr, FALSE);
-                }
-
-                progress.files.fetch_add(localFiles, std::memory_order_relaxed);
-                progress.folders.fetch_add(localFolders, std::memory_order_relaxed);
-                progress.bytes_processed.fetch_add(localBytes, std::memory_order_relaxed);
-
-                if (childDirs.empty()) return;
-
-                // Only share to global queue when queuedCount is low (< numThreads * 2); otherwise recurse directly via NtOpenFile(RootDirectory = hDir)!
-                if (!dirPathIfRoot.empty() && queuedCount.load(std::memory_order_relaxed) < numThreads * 2) {
-                    std::wstring base = dirPathIfRoot;
-                    while (!base.empty() && base.back() == L'\\') base.pop_back();
-                    std::lock_guard<std::mutex> lk(qMtx);
-                    for (const auto& cd : childDirs) {
-                        std::wstring sub;
-                        sub.reserve(base.size() + 1 + cd.name_len);
-                        sub.append(base);
-                        sub.push_back(L'\\');
-                        sub.append(out.names.data() + cd.name_off, cd.name_len);
-                        dirQueue.emplace_back(cd.dir_id, std::move(sub));
-                    }
-                    queuedCount.store(dirQueue.size(), std::memory_order_relaxed);
-                    qCv.notify_all();
-                    return;
-                }
-
-                // Otherwise open child directories directly relative to hDir via NtOpenFile (zero path parsing!)
-                std::wstring prefix;
-                if (!dirPathIfRoot.empty()) {
-                    prefix = dirPathIfRoot;
-                    while (!prefix.empty() && prefix.back() == L'\\') prefix.pop_back();
-                }
-
-                for (size_t i = 0; i < childDirs.size(); ++i) {
-                    const auto& cd = childDirs[i];
-                    // If other workers became idle mid-loop and we have prefix, donate remaining children
-                    if (!prefix.empty() && i + 1 < childDirs.size() && queuedCount.load(std::memory_order_relaxed) < numThreads) {
-                        std::lock_guard<std::mutex> lk(qMtx);
-                        for (size_t j = i; j < childDirs.size(); ++j) {
-                            const auto& rem = childDirs[j];
-                            std::wstring sub;
-                            sub.reserve(prefix.size() + 1 + rem.name_len);
-                            sub.append(prefix);
-                            sub.push_back(L'\\');
-                            sub.append(out.names.data() + rem.name_off, rem.name_len);
-                            dirQueue.emplace_back(rem.dir_id, std::move(sub));
-                        }
-                        queuedCount.store(dirQueue.size(), std::memory_order_relaxed);
-                        qCv.notify_all();
-                        break;
-                    }
-
-                    // Copy name locally since out.names may reallocate during child scan
-                    wchar_t nameBuf[260];
-                    std::wstring longName;
-                    PWSTR namePtr = nullptr;
-                    USHORT byteLen = static_cast<USHORT>(cd.name_len * sizeof(wchar_t));
-                    if (cd.name_len < 256) {
-                        memcpy(nameBuf, out.names.data() + cd.name_off, byteLen);
-                        namePtr = nameBuf;
-                    } else {
-                        longName.assign(out.names.data() + cd.name_off, cd.name_len);
-                        namePtr = longName.data();
-                    }
-
-                    UNICODE_STRING_LOCAL uName{ byteLen, byteLen, namePtr };
-                    OBJECT_ATTRIBUTES_LOCAL oa{};
-                    oa.Length = sizeof(oa);
-                    oa.RootDirectory = hDir;
-                    oa.ObjectName = &uName;
-                    oa.Attributes = 0x00000040; // OBJ_CASE_INSENSITIVE
-
-                    IO_STATUS_BLOCK_LOCAL childIosb{};
-                    HandleGuard hChild;
-                    LONG openSt = ntOpenFile(
-                        &hChild.h,
-                        FILE_LIST_DIRECTORY | SYNCHRONIZE,
-                        &oa,
-                        &childIosb,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                        0x00004000 | 0x00000020 | 0x00000001 /*BACKUP_INTENT | SYNC_IO_NONALERT | DIRECTORY_FILE*/);
-                    if (openSt >= 0 && hChild.h != INVALID_HANDLE_VALUE) {
-                        std::wstring childPath;
-                        if (!prefix.empty()) {
-                            childPath.reserve(prefix.size() + 1 + cd.name_len);
-                            childPath.append(prefix);
-                            childPath.push_back(L'\\');
-                            childPath.append(namePtr, cd.name_len);
-                        }
-                        self(self, hChild.h, cd.dir_id, childPath, depth + 1);
                     }
                 }
-            };
 
-            while (true) {
-                std::pair<uint32_t, std::wstring> task;
-                {
-                    std::unique_lock<std::mutex> lk(qMtx);
-                    qCv.wait(lk, [&]() { return !dirQueue.empty() || allDone || progress.is_cancelled(); });
-                    if ((dirQueue.empty() && allDone) || progress.is_cancelled()) break;
-                    task = std::move(dirQueue.front());
-                    dirQueue.pop_front();
-                    queuedCount.store(dirQueue.size(), std::memory_order_relaxed);
-                    ++activeWorkers;
-                }
-
-                uint32_t parentDirId = task.first;
-                const std::wstring& dirPath = task.second;
-                if (t < 4) curDirPerWorker[t] = dirPath;
-
-                std::wstring extDir = MakeExtendedDirPath(dirPath);
-                HandleGuard hDir;
-                hDir.h = CreateFileW(
-                    extDir.c_str(),
-                    FILE_LIST_DIRECTORY | SYNCHRONIZE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    nullptr,
-                    OPEN_EXISTING,
-                    FILE_FLAG_BACKUP_SEMANTICS,
-                    nullptr);
-
-                if (hDir.h != INVALID_HANDLE_VALUE && ntOpenFile && ntQueryDir) {
-                    scanDirHandle(scanDirHandle, hDir.h, parentDirId, dirPath, 0);
-                }
+                progress.files.fetch_add(lf, std::memory_order_relaxed);
+                progress.folders.fetch_add(ld, std::memory_order_relaxed);
+                progress.bytes_processed.fetch_add(lb, std::memory_order_relaxed);
 
                 {
                     std::lock_guard<std::mutex> lk(qMtx);
+                    for (auto& sub : found) dirQueue.push_back(std::move(sub));
                     --activeWorkers;
                     if (dirQueue.empty() && activeWorkers == 0) {
                         allDone = true;
+                        qCv.notify_all();
+                    } else if (!found.empty()) {
                         qCv.notify_all();
                     }
                 }
@@ -1174,7 +1794,6 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
     }
 
     for (auto& th : threads) th.join();
-    double tWalk = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
     if (progress.is_cancelled()) {
         outErr = L"Scan cancelled.";
         return nullptr;
@@ -1206,7 +1825,6 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
     });
     dirIdToNodeIdx[0] = 0;
 
-    // Pass 1: Assign node indices and populate names/extensions
     for (const auto& wo : workerOuts) {
         size_t baseNameOff = names.size();
         names.insert(names.end(), wo.names.begin(), wo.names.end());
@@ -1222,7 +1840,6 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
                 alloc = 0; // Hard link already counted once on disk
             }
             uint16_t extId = isDir ? 0 : interner.intern(std::wstring_view(names.data() + nameOff, e.name_len));
-            // Temporarily store e.parent_dir_id in node.parent, then remap in Pass 2
             nodes.push_back(TreeNode{
                 e.size, alloc, e.modified,
                 e.parent_dir_id, NONE_IDX, NONE_IDX, 0, 0,
@@ -1231,29 +1848,44 @@ std::unique_ptr<DiskTree> ScanParallelWin32(
         }
     }
 
-    // Pass 2: Remap parent_dir_id -> parent node index
     for (size_t i = 1; i < nodes.size(); ++i) {
         uint32_t pid = nodes[i].parent;
         nodes[i].parent = (pid < maxDirId) ? dirIdToNodeIdx[pid] : 0;
     }
-    double tMerge = std::chrono::duration<double>(std::chrono::steady_clock::now() - startTime).count();
-    wprintf(L"[Profile] Walk=%.2fs, Merge=%.2fs (entries=%zu, dirs=%u)\n", tWalk, tMerge - tWalk, totalEntries, maxDirId);
 
     return FinalizeTree(std::move(nodes), std::move(names), std::move(interner), 0, cleanRoot, ScanMode::ParallelWin32, startTime, progress, outErr);
 }
 
 } // namespace
 
-ScanResult ScanDriveOrFolder(const std::wstring& targetPath, bool isDrive, wchar_t driveLetter, ScanProgress& progress) {
+void InvalidateStdHyperCache(wchar_t driveLetter) {
+    DeleteFileW(GetStdCachePath(driveLetter).c_str());
+}
+
+ScanResult ScanDriveOrFolder(const std::wstring& targetPath, bool isDrive, wchar_t driveLetter, ScanProgress& progress, bool forceFull) {
     auto startTime = std::chrono::steady_clock::now();
     ScanResult res;
     if (isDrive) {
+        if (!forceFull) {
+            res.tree = TrySyncHyperCacheUsn(driveLetter, progress, startTime, res.error);
+            if (res.tree || progress.is_cancelled()) return res;
+            res.error.clear();
+        }
         res.tree = TryScanNtfsMft(driveLetter, progress, startTime, res.error);
         if (res.tree || progress.is_cancelled()) return res;
         res.error.clear();
+
+        // Non-admin fallback: try HyperCache Instant snapshot first (< 0.5s), else full NtOpenFile walk
+        if (!forceFull) {
+            res.tree = TryLoadStdHyperCache(driveLetter, progress, startTime);
+            if (res.tree || progress.is_cancelled()) return res;
+        }
         wchar_t root[8];
         swprintf_s(root, L"%c:\\", driveLetter);
         res.tree = ScanParallelWin32(root, progress, startTime, res.error);
+        if (res.tree) {
+            SaveStdHyperCache(driveLetter, *res.tree);
+        }
         return res;
     } else {
         res.tree = ScanParallelWin32(targetPath, progress, startTime, res.error);

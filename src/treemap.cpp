@@ -94,7 +94,7 @@ void Squarify(const std::vector<std::pair<uint32_t, double>>& items, D2D1_RECT_F
     }
 }
 
-void LayoutNode(const DiskTree& tree, uint32_t dirIdx, D2D1_RECT_F rect, int depth, bool hideSystem, std::vector<TreemapTile>& out) {
+void LayoutNode(const DiskTree& tree, uint32_t dirIdx, D2D1_RECT_F rect, int depth, const VisibilityFilter& filters, std::vector<TreemapTile>& out) {
     float w = rect.right - rect.left;
     float h = rect.bottom - rect.top;
     if (out.size() >= MAX_TILES || w < 3.0f || h < 3.0f) return;
@@ -105,7 +105,7 @@ void LayoutNode(const DiskTree& tree, uint32_t dirIdx, D2D1_RECT_F rect, int dep
     uint32_t c = tree.nodes[dirIdx].first_child;
     while (c != NONE_IDX) {
         const auto& cn = tree.nodes[c];
-        if (!hideSystem || (cn.flags & FLAG_IS_SYSTEM) == 0) {
+        if (filters.AllowsNode(cn, false, true)) {
             uint64_t sz = useAlloc ? cn.allocated : cn.size;
             if (sz > 0) {
                 children.emplace_back(c, sz);
@@ -138,7 +138,7 @@ void LayoutNode(const DiskTree& tree, uint32_t dirIdx, D2D1_RECT_F rect, int dep
         if (node.is_dir() && depth < MAX_DEPTH && cw >= 10.0f && ch >= 10.0f) {
             size_t before = out.size();
             D2D1_RECT_F inner = D2D1::RectF(cr.left + 1.5f, cr.top + 1.5f, cr.right - 1.5f, cr.bottom - 1.5f);
-            LayoutNode(tree, cidx, inner, depth + 1, hideSystem, out);
+            LayoutNode(tree, cidx, inner, depth + 1, filters, out);
             if (out.size() == before) {
                 out.push_back(TreemapTile{ cidx, cr, 0x4476A8, true });
             }
@@ -218,9 +218,9 @@ void TreemapControl::SetSelected(uint32_t selIdx) {
     }
 }
 
-void TreemapControl::SetHideSystem(bool hide) {
-    if (hide_system != hide) {
-        hide_system = hide;
+void TreemapControl::SetFilters(const VisibilityFilter& f) {
+    if (filters != f) {
+        filters = f;
         layout_dirty = true;
         Invalidate();
     }
@@ -280,7 +280,7 @@ void TreemapControl::RebuildLayout() {
     float h = static_cast<float>(rc.bottom - rc.top);
     if (w < 4.0f || h < 4.0f) return;
 
-    LayoutNode(*tree, root_idx, D2D1::RectF(0.0f, 0.0f, w, h), 0, hide_system, tiles);
+    LayoutNode(*tree, root_idx, D2D1::RectF(0.0f, 0.0f, w, h), 0, filters, tiles);
 }
 
 uint32_t TreemapControl::HitTest(int px, int py) const {

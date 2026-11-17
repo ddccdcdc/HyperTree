@@ -13,6 +13,7 @@
 #pragma comment(linker, "\"/manifestdependency:type='win32' name='Microsoft.Windows.Common-Controls' version='6.0.0.0' processorArchitecture='*' publicKeyToken='6595b64144ccf1df' language='*'\"")
 
 #include "i18n.h"
+#include "filters.h"
 #include "model.h"
 #include "scanner.h"
 #include "treemap.h"
@@ -30,7 +31,7 @@
 #include <thread>
 #include <unordered_set>
 
-constexpr const wchar_t* APP_VERSION = L"1.2.1";
+constexpr const wchar_t* APP_VERSION = L"1.3.0";
 
 constexpr UINT WM_SCAN_DONE    = WM_APP + 1;
 constexpr UINT WM_SEARCH_DONE  = WM_APP + 2;
@@ -64,17 +65,26 @@ enum ControlId : int {
     IDC_BTN_LANG    = 121,
     IDC_VER_LBL     = 122,
     IDC_BTN_UPDATE  = 123,
+    IDC_BTN_FILTERS = 124,
+    IDC_CAT_CMB     = 125,
+    IDC_AGE_CMB     = 126,
+    IDC_FILTER_LBL  = 127,
 };
 
 enum ContextMenuId : UINT {
-    IDM_OPEN_EXPLORER = 2001,
-    IDM_OPEN_FILE     = 2002,
-    IDM_ZOOM_TREEMAP  = 2003,
-    IDM_COPY_PATH     = 2004,
-    IDM_PROPERTIES    = 2005,
-    IDM_RECYCLE_BIN   = 2006,
-    IDM_DELETE_PERM   = 2007,
-    IDM_LANG_BASE     = 3000,
+    IDM_OPEN_EXPLORER  = 2001,
+    IDM_OPEN_FILE      = 2002,
+    IDM_ZOOM_TREEMAP   = 2003,
+    IDM_COPY_PATH      = 2004,
+    IDM_PROPERTIES     = 2005,
+    IDM_RECYCLE_BIN    = 2006,
+    IDM_DELETE_PERM    = 2007,
+    IDM_FLT_SYSTEM     = 2101,
+    IDM_FLT_HIDDEN     = 2102,
+    IDM_FLT_CLOUD      = 2103,
+    IDM_FLT_NOSMALL    = 2104,
+    IDM_FLT_FULLRESCAN = 2105,
+    IDM_LANG_BASE      = 3000,
 };
 
 struct FlatRow {
@@ -106,6 +116,7 @@ struct AppState {
     HWND btnExport = nullptr;
     HWND chkTreemap = nullptr;
     HWND chkSystem = nullptr;
+    HWND btnFilters = nullptr;
     HWND btnLang = nullptr;
     HWND btnTheme = nullptr;
     HWND progressBar = nullptr;
@@ -116,6 +127,9 @@ struct AppState {
     HWND listTypes = nullptr;
     HWND editSearch = nullptr;
     HWND minSizeCombo = nullptr;
+    HWND catCombo = nullptr;
+    HWND ageCombo = nullptr;
+    HWND filterLbl = nullptr;
     HWND btnClear = nullptr;
     HWND btnTmUp = nullptr;
     HWND btnTmRoot = nullptr;
@@ -147,11 +161,24 @@ struct AppState {
     std::mutex searchMtx;
     std::vector<uint32_t> pendingSearchResults;
     uint64_t pendingSearchGen = 0;
+    uint64_t pendingSearchTotalBytes = 0;
     std::vector<size_t> sortedTypeIndices;
     uint32_t selectedNode = NONE_IDX;
     uint32_t treemapRoot = 0;
     bool showTreemap = true;
     bool showSystemFiles = false;
+    bool hideHiddenFiles = false;
+    bool hideCloudFiles = false;
+    bool hideSmallInTree = false;
+
+    VisibilityFilter CurrentVisibilityFilter() const noexcept {
+        VisibilityFilter f;
+        f.hide_system = !showSystemFiles;
+        f.hide_hidden = hideHiddenFiles;
+        f.hide_cloud = hideCloudFiles;
+        f.min_tree_bytes = hideSmallInTree ? (1024ULL * 1024ULL) : 0ULL;
+        return f;
+    }
     LangId lang = LangId::English;
     int fileSortCol = 1;
     bool fileSortAsc = false;
@@ -466,7 +493,7 @@ void ApplyTheme() {
             }
         }
     }
-    for (HWND cmb : { g_app.driveCombo, g_app.minSizeCombo }) {
+    for (HWND cmb : { g_app.driveCombo, g_app.minSizeCombo, g_app.catCombo, g_app.ageCombo }) {
         if (cmb) {
             DarkThemeApi::AllowWindow(cmb, g_app.darkMode);
             SetWindowTheme(cmb, g_app.darkMode ? L"DarkMode_CFD" : L"CFD", nullptr);
@@ -480,9 +507,9 @@ void ApplyTheme() {
         }
     }
     for (HWND c : { g_app.editSearch, g_app.btnFolder, g_app.btnScan, g_app.btnElevate,
-                    g_app.btnExport, g_app.btnLang, g_app.btnTheme, g_app.btnClear,
+                    g_app.btnExport, g_app.btnFilters, g_app.btnLang, g_app.btnTheme, g_app.btnClear,
                     g_app.btnTmUp, g_app.btnTmRoot, g_app.btnUpdate, g_app.chkTreemap, g_app.chkSystem,
-                    g_app.progressBar, g_app.statusLbl, g_app.tmLbl, g_app.verLbl, g_app.tabCtrl }) {
+                    g_app.progressBar, g_app.statusLbl, g_app.filterLbl, g_app.tmLbl, g_app.verLbl, g_app.tabCtrl }) {
         if (c) {
             DarkThemeApi::AllowWindow(c, g_app.darkMode);
             SetWindowTheme(c, g_app.darkMode ? L"DarkMode_Explorer" : L"Explorer", nullptr);
@@ -564,10 +591,11 @@ void ApplyLanguage() {
     SetWindowRtl(g_app.hwnd, L.rtl);
     for (HWND h : {
         g_app.driveCombo, g_app.btnFolder, g_app.btnScan, g_app.btnElevate,
-        g_app.btnExport, g_app.chkTreemap, g_app.chkSystem, g_app.btnLang,
+        g_app.btnExport, g_app.btnFilters, g_app.chkTreemap, g_app.chkSystem, g_app.btnLang,
         g_app.btnTheme, g_app.progressBar, g_app.statusLbl, g_app.verLbl, g_app.btnUpdate,
         g_app.tabCtrl, g_app.listTree, g_app.listFiles, g_app.listTypes, g_app.editSearch,
-        g_app.minSizeCombo, g_app.btnClear, g_app.btnTmUp, g_app.btnTmRoot, g_app.tmLbl
+        g_app.minSizeCombo, g_app.catCombo, g_app.ageCombo, g_app.filterLbl,
+        g_app.btnClear, g_app.btnTmUp, g_app.btnTmRoot, g_app.tmLbl
     }) {
         SetWindowRtl(h, L.rtl);
     }
@@ -609,6 +637,7 @@ void RebuildFlatRows() {
         return;
     }
 
+    const VisibilityFilter vis = g_app.CurrentVisibilityFilter();
     std::vector<std::pair<uint32_t, uint16_t>> stack;
     stack.reserve(256);
     stack.emplace_back(g_app.tree->root_idx, 0);
@@ -617,7 +646,7 @@ void RebuildFlatRows() {
         auto [idx, depth] = stack.back();
         stack.pop_back();
         const auto& n = g_app.tree->nodes[idx];
-        if (!g_app.showSystemFiles && idx != g_app.tree->root_idx && (n.flags & FLAG_IS_SYSTEM) != 0) {
+        if (!vis.AllowsNode(n, idx == g_app.tree->root_idx, true)) {
             continue;
         }
         bool hasChildren = n.is_dir() && n.first_child != NONE_IDX;
@@ -627,7 +656,7 @@ void RebuildFlatRows() {
             std::vector<uint32_t> children;
             uint32_t c = n.first_child;
             while (c != NONE_IDX) {
-                if (g_app.showSystemFiles || (g_app.tree->nodes[c].flags & FLAG_IS_SYSTEM) == 0) {
+                if (vis.AllowsNode(g_app.tree->nodes[c], false, true)) {
                     children.push_back(c);
                 }
                 c = g_app.tree->nodes[c].next_sibling;
@@ -643,23 +672,7 @@ void RebuildFlatRows() {
 
 void SortFilteredFiles() {
     if (!g_app.tree || g_app.filteredFiles.size() <= 1) return;
-    int col = g_app.fileSortCol;
-    bool asc = g_app.fileSortAsc;
-    std::sort(g_app.filteredFiles.begin(), g_app.filteredFiles.end(), [&](uint32_t a, uint32_t b) {
-        const auto& na = g_app.tree->nodes[a];
-        const auto& nb = g_app.tree->nodes[b];
-        int cmp = 0;
-        if (col == 0) {
-            cmp = g_app.tree->node_name(a).compare(g_app.tree->node_name(b));
-        } else if (col == 1) {
-            cmp = (na.size < nb.size) ? -1 : (na.size > nb.size ? 1 : 0);
-        } else if (col == 2) {
-            cmp = (na.allocated < nb.allocated) ? -1 : (na.allocated > nb.allocated ? 1 : 0);
-        } else if (col == 3) {
-            cmp = (na.modified < nb.modified) ? -1 : (na.modified > nb.modified ? 1 : 0);
-        }
-        return asc ? (cmp < 0) : (cmp > 0);
-    });
+    SortNodeIndexList(*g_app.tree, g_app.filteredFiles, g_app.fileSortCol, g_app.fileSortAsc);
     InvalidateRect(g_app.listFiles, nullptr, FALSE);
 }
 
@@ -683,39 +696,13 @@ void SortFileTypes() {
     InvalidateRect(g_app.listTypes, nullptr, FALSE);
 }
 
-inline wchar_t FastToLower(wchar_t c) {
-    if (c >= L'A' && c <= L'Z') return static_cast<wchar_t>(c - L'A' + L'a');
-    if (c < 128) return c;
-    return static_cast<wchar_t>(towlower(c));
-}
-
-bool ContainsCaseInsensitive(std::wstring_view hay, std::wstring_view lowerNeedle) {
-    if (lowerNeedle.empty()) return true;
-    if (hay.size() < lowerNeedle.size()) return false;
-    const size_t limit = hay.size() - lowerNeedle.size();
-    for (size_t i = 0; i <= limit; ++i) {
-        size_t j = 0;
-        while (j < lowerNeedle.size() && FastToLower(hay[i + j]) == lowerNeedle[j]) ++j;
-        if (j == lowerNeedle.size()) return true;
-    }
-    return false;
-}
-
-bool EndsWithCaseInsensitive(std::wstring_view hay, std::wstring_view lowerSuffix) {
-    if (hay.size() < lowerSuffix.size()) return false;
-    size_t off = hay.size() - lowerSuffix.size();
-    for (size_t i = 0; i < lowerSuffix.size(); ++i) {
-        if (FastToLower(hay[off + i]) != lowerSuffix[i]) return false;
-    }
-    return true;
-}
-
 void RebuildFileFilter() {
     uint64_t myGen = g_app.searchGen.fetch_add(1, std::memory_order_relaxed) + 1;
     auto tree = g_app.tree;
     if (!tree) {
         g_app.filteredFiles.clear();
         ListView_SetItemCountEx(g_app.listFiles, 0, 0);
+        if (g_app.filterLbl) SetWindowTextW(g_app.filterLbl, L"");
         return;
     }
 
@@ -729,40 +716,64 @@ void RebuildFileFilter() {
     if (minSel == 1) minBytes = 1024ULL * 1024ULL;
     else if (minSel == 2) minBytes = 10ULL * 1024ULL * 1024ULL;
     else if (minSel == 3) minBytes = 100ULL * 1024ULL * 1024ULL;
-    else if (minSel == 4) minBytes = 1024ULL * 1024ULL * 1024ULL;
+    else if (minSel == 4) minBytes = 500ULL * 1024ULL * 1024ULL;
+    else if (minSel == 5) minBytes = 1024ULL * 1024ULL * 1024ULL;
 
-    bool showSys = g_app.showSystemFiles;
+    int catSel = static_cast<int>(SendMessageW(g_app.catCombo, CB_GETCURSEL, 0, 0));
+    FileCategory cat = (catSel > 0 && catSel < static_cast<int>(FileCategory::Count))
+        ? static_cast<FileCategory>(catSel) : FileCategory::All;
+
+    int ageSel = static_cast<int>(SendMessageW(g_app.ageCombo, CB_GETCURSEL, 0, 0));
+    AgeFilter age = (ageSel > 0 && ageSel < static_cast<int>(AgeFilter::Count))
+        ? static_cast<AgeFilter>(ageSel) : AgeFilter::Any;
+
+    VisibilityFilter vis = g_app.CurrentVisibilityFilter();
     int sortCol = g_app.fileSortCol;
     bool sortAsc = g_app.fileSortAsc;
     HWND hwnd = g_app.hwnd;
 
-    std::thread([tree, myGen, q = std::move(q), minBytes, showSys, sortCol, sortAsc, hwnd]() {
+    std::thread([tree, myGen, q = std::move(q), minBytes, cat, age, vis, sortCol, sortAsc, hwnd]() {
+        ParsedSearchQuery pq = ParseSearchQuery(q);
+        const uint64_t effectiveMinBytes = std::max(minBytes, pq.min_size);
+
+        std::vector<FileCategory> extCats;
+        if (cat != FileCategory::All && cat != FileCategory::CloudOnly) {
+            extCats.resize(tree->extensions.size(), FileCategory::All);
+            for (size_t i = 0; i < tree->extensions.size(); ++i) {
+                extCats[i] = ClassifyExtension(tree->extensions[i].ext);
+            }
+        }
+
+        uint64_t nowU64 = 0;
+        if (age != AgeFilter::Any) {
+            FILETIME nowFt{};
+            GetSystemTimeAsFileTime(&nowFt);
+            nowU64 = (static_cast<uint64_t>(nowFt.dwHighDateTime) << 32) | nowFt.dwLowDateTime;
+        }
+
         std::vector<uint32_t> out;
         const size_t cap = 200000;
-        out.reserve(q.empty() ? std::min(cap, tree->top_files.size()) : 1024);
+        out.reserve((pq.empty() && cat == FileCategory::All && age == AgeFilter::Any)
+            ? std::min(cap, tree->top_files.size()) : 1024);
 
-        std::wstring_view extFilter;
-        if (q.size() > 2 && q[0] == L'*' && q[1] == L'.') extFilter = std::wstring_view(q).substr(1);
-        const bool pathSearch = (q.find(L'\\') != std::wstring::npos || q.find(L'/') != std::wstring::npos);
-
+        uint64_t totalMatchedBytes = 0;
         size_t iter = 0;
         for (uint32_t idx : tree->top_files) {
             if ((++iter & 4095) == 0 && g_app.searchGen.load(std::memory_order_relaxed) != myGen) {
                 return;
             }
             const auto& n = tree->nodes[idx];
-            if (n.size < minBytes) break;
-            if (!showSys && (n.flags & FLAG_IS_SYSTEM) != 0) continue;
-            if (!q.empty()) {
-                if (!extFilter.empty()) {
-                    if (!EndsWithCaseInsensitive(tree->node_name(idx), extFilter)) continue;
-                } else if (!pathSearch) {
-                    if (!ContainsCaseInsensitive(tree->node_name(idx), q)) continue;
-                } else {
-                    std::wstring full = tree->full_path(idx);
-                    if (!ContainsCaseInsensitive(full, q)) continue;
-                }
+            if (n.size < effectiveMinBytes) break;
+            if (!vis.AllowsNode(n, false, false)) continue;
+            if (cat == FileCategory::CloudOnly) {
+                if ((n.flags & FLAG_IS_CLOUD) == 0) continue;
+            } else if (cat != FileCategory::All) {
+                if (n.ext_id >= extCats.size() || extCats[n.ext_id] != cat) continue;
             }
+            if (age != AgeFilter::Any && !AgeMatches(n.modified, age, nowU64)) continue;
+            if (!MatchesSearchQuery(*tree, idx, pq)) continue;
+
+            totalMatchedBytes += n.size;
             out.push_back(idx);
             if (out.size() >= cap) break;
         }
@@ -770,24 +781,7 @@ void RebuildFileFilter() {
         if (g_app.searchGen.load(std::memory_order_relaxed) != myGen) return;
 
         if (sortCol != 1 || sortAsc) {
-            std::sort(out.begin(), out.end(), [&](uint32_t a, uint32_t b) {
-                const auto& na = tree->nodes[a];
-                const auto& nb = tree->nodes[b];
-                int cmp = 0;
-                switch (sortCol) {
-                    case 0: {
-                        auto sa = tree->node_name(a);
-                        auto sb = tree->node_name(b);
-                        cmp = _wcsnicmp(sa.data(), sb.data(), std::min(sa.size(), sb.size()));
-                        if (cmp == 0 && sa.size() != sb.size()) cmp = (sa.size() < sb.size()) ? -1 : 1;
-                        break;
-                    }
-                    case 1: cmp = (na.size < nb.size) ? -1 : (na.size > nb.size ? 1 : 0); break;
-                    case 2: cmp = (na.allocated < nb.allocated) ? -1 : (na.allocated > nb.allocated ? 1 : 0); break;
-                    case 3: cmp = (na.modified < nb.modified) ? -1 : (na.modified > nb.modified ? 1 : 0); break;
-                }
-                return sortAsc ? (cmp < 0) : (cmp > 0);
-            });
+            SortNodeIndexList(*tree, out, sortCol, sortAsc);
         }
 
         if (g_app.searchGen.load(std::memory_order_relaxed) != myGen) return;
@@ -797,6 +791,7 @@ void RebuildFileFilter() {
             if (g_app.searchGen.load(std::memory_order_relaxed) == myGen) {
                 g_app.pendingSearchResults = std::move(out);
                 g_app.pendingSearchGen = myGen;
+                g_app.pendingSearchTotalBytes = totalMatchedBytes;
                 PostMessageW(hwnd, WM_SEARCH_DONE, 0, 0);
             }
         }
@@ -841,7 +836,7 @@ void LayoutControls() {
 
     // Row 1: Toolbar
     int x = pad;
-    int comboW = std::min(320, std::max(150, W - 760));
+    int comboW = std::min(300, std::max(90, W - 822));
     MoveWindow(g_app.driveCombo, x, y, comboW, 240, TRUE); x += comboW + 6;
     MoveWindow(g_app.btnFolder, x, y, 76, 26, TRUE); x += 82;
     MoveWindow(g_app.btnScan, x, y, 86, 26, TRUE); x += 92;
@@ -852,6 +847,7 @@ void LayoutControls() {
     MoveWindow(g_app.btnLang, W - pad - 144, y, 78, 26, TRUE);
     MoveWindow(g_app.chkTreemap, W - pad - 226, y + 3, 76, 20, TRUE);
     MoveWindow(g_app.chkSystem, W - pad - 332, y + 3, 100, 20, TRUE);
+    MoveWindow(g_app.btnFilters, W - pad - 412, y, 74, 26, TRUE);
 
     y += 32;
 
@@ -881,9 +877,13 @@ void LayoutControls() {
     MoveWindow(g_app.listTree, pad, contentY, W - pad * 2, contentH, TRUE);
 
     // Tab 1: File Search bar + ListView
-    MoveWindow(g_app.editSearch, pad, contentY + 2, 260, 24, TRUE);
-    MoveWindow(g_app.btnClear, pad + 266, contentY + 2, 56, 24, TRUE);
-    MoveWindow(g_app.minSizeCombo, pad + 328, contentY + 2, 110, 160, TRUE);
+    MoveWindow(g_app.editSearch, pad, contentY + 2, 240, 24, TRUE);
+    MoveWindow(g_app.btnClear, pad + 246, contentY + 2, 54, 24, TRUE);
+    MoveWindow(g_app.minSizeCombo, pad + 306, contentY + 2, 102, 200, TRUE);
+    MoveWindow(g_app.catCombo, pad + 414, contentY + 2, 118, 220, TRUE);
+    MoveWindow(g_app.ageCombo, pad + 538, contentY + 2, 124, 200, TRUE);
+    int lblX = pad + 670;
+    MoveWindow(g_app.filterLbl, lblX, contentY + 5, std::max(80, W - pad - lblX), 18, TRUE);
     MoveWindow(g_app.listFiles, pad, contentY + 30, W - pad * 2, std::max(60, contentH - 30), TRUE);
 
     // Tab 2: File Types ListView
@@ -914,11 +914,21 @@ void SwitchTab(int tab) {
     ShowWindow(g_app.editSearch, tab == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.btnClear, tab == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.minSizeCombo, tab == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.catCombo, tab == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.ageCombo, tab == 1 ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_app.filterLbl, tab == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.listFiles, tab == 1 ? SW_SHOW : SW_HIDE);
     ShowWindow(g_app.listTypes, tab == 2 ? SW_SHOW : SW_HIDE);
 }
 
-void StartScan(bool isDrive, wchar_t driveLetter, const std::wstring& folderPath) {
+void ApplyVisibilityFilters() {
+    SendMessageW(g_app.chkSystem, BM_SETCHECK, g_app.showSystemFiles ? BST_CHECKED : BST_UNCHECKED, 0);
+    g_app.treemap.SetFilters(g_app.CurrentVisibilityFilter());
+    RebuildFlatRows();
+    RebuildFileFilter();
+}
+
+void StartScan(bool isDrive, wchar_t driveLetter, const std::wstring& folderPath, bool forceFullOverride = false) {
     if (g_app.scanning.load()) return;
     g_app.progress.reset();
     g_app.scanning.store(true);
@@ -929,8 +939,9 @@ void StartScan(bool isDrive, wchar_t driveLetter, const std::wstring& folderPath
     SendMessageW(g_app.progressBar, PBM_SETPOS, 0, 0);
     SetTimer(g_app.hwnd, 1, 33, nullptr);
 
-    std::thread([isDrive, driveLetter, folderPath]() {
-        ScanResult res = ScanDriveOrFolder(folderPath, isDrive, driveLetter, g_app.progress);
+    bool forceFull = forceFullOverride || (GetKeyState(VK_SHIFT) < 0);
+    std::thread([isDrive, driveLetter, folderPath, forceFull]() {
+        ScanResult res = ScanDriveOrFolder(folderPath, isDrive, driveLetter, g_app.progress, forceFull);
         {
             std::lock_guard<std::mutex> lk(g_app.resultMtx);
             g_app.pendingResult = std::move(res);
@@ -974,9 +985,10 @@ void ShowNodeContextMenu(uint32_t nodeIdx, int screenX, int screenY) {
                 if (MoveToRecycleBin(path)) {
                     g_app.tree->nodes[nodeIdx].size = 0;
                     g_app.tree->nodes[nodeIdx].allocated = 0;
+                    if (!path.empty()) InvalidateStdHyperCache(path[0]);
                     g_app.treemap.SetData(g_app.tree.get(), g_app.treemapRoot, g_app.selectedNode);
-                    InvalidateRect(g_app.listTree, nullptr, FALSE);
-                    InvalidateRect(g_app.listFiles, nullptr, FALSE);
+                    RebuildFlatRows();
+                    RebuildFileFilter();
                 }
             }
             break;
@@ -987,9 +999,10 @@ void ShowNodeContextMenu(uint32_t nodeIdx, int screenX, int screenY) {
                 if (DeletePermanently(path)) {
                     g_app.tree->nodes[nodeIdx].size = 0;
                     g_app.tree->nodes[nodeIdx].allocated = 0;
+                    if (!path.empty()) InvalidateStdHyperCache(path[0]);
                     g_app.treemap.SetData(g_app.tree.get(), g_app.treemapRoot, g_app.selectedNode);
-                    InvalidateRect(g_app.listTree, nullptr, FALSE);
-                    InvalidateRect(g_app.listFiles, nullptr, FALSE);
+                    RebuildFlatRows();
+                    RebuildFileFilter();
                 }
             }
             break;
@@ -1203,6 +1216,7 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             g_app.chkTreemap = mk(L"BUTTON", L"Treemap", BS_AUTOCHECKBOX, IDC_CHK_TREEMAP);
             SendMessageW(g_app.chkTreemap, BM_SETCHECK, BST_CHECKED, 0);
             g_app.chkSystem  = mk(L"BUTTON", L"System Files", BS_AUTOCHECKBOX, IDC_CHK_SYSTEM);
+            g_app.btnFilters = mk(L"BUTTON", L"Filters \u25BE", BS_PUSHBUTTON, IDC_BTN_FILTERS);
             g_app.btnLang    = mk(L"BUTTON", L"Language", BS_PUSHBUTTON, IDC_BTN_LANG);
             g_app.btnTheme   = mk(L"BUTTON", L"Light", BS_PUSHBUTTON, IDC_BTN_THEME);
 
@@ -1251,10 +1265,24 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             SendMessageW(g_app.editSearch, EM_SETCUEBANNER, TRUE, reinterpret_cast<LPARAM>(L"Search files or *.ext..."));
             g_app.btnClear     = mk(L"BUTTON", L"Clear", BS_PUSHBUTTON, IDC_BTN_CLEAR);
             g_app.minSizeCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_MINSIZE_CMB);
-            for (const wchar_t* s : { L"All sizes", L"> 1 MB", L"> 10 MB", L"> 100 MB", L"> 1 GB" }) {
+            for (const wchar_t* s : { L"All sizes", L"> 1 MB", L"> 10 MB", L"> 100 MB", L"> 500 MB", L"> 1 GB" }) {
                 SendMessageW(g_app.minSizeCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
             }
             SendMessageW(g_app.minSizeCombo, CB_SETCURSEL, 0, 0);
+
+            g_app.catCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_CAT_CMB);
+            for (const wchar_t* s : { L"All Types", L"Videos", L"Images", L"Audio", L"Archives", L"Documents", L"Executables", L"Code", L"Cloud Only" }) {
+                SendMessageW(g_app.catCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+            }
+            SendMessageW(g_app.catCombo, CB_SETCURSEL, 0, 0);
+
+            g_app.ageCombo = mk(L"COMBOBOX", L"", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_AGE_CMB);
+            for (const wchar_t* s : { L"Any Time", L"Last 24 Hours", L"Last 7 Days", L"Last 30 Days", L"Older than 1 Year" }) {
+                SendMessageW(g_app.ageCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(s));
+            }
+            SendMessageW(g_app.ageCombo, CB_SETCURSEL, 0, 0);
+
+            g_app.filterLbl = mk(L"STATIC", L"", SS_LEFT | SS_NOPREFIX, IDC_FILTER_LBL);
 
             g_app.btnTmUp   = mk(L"BUTTON", L"Up", BS_PUSHBUTTON, IDC_BTN_TM_UP);
             g_app.btnTmRoot = mk(L"BUTTON", L"Root", BS_PUSHBUTTON, IDC_BTN_TM_ROOT);
@@ -1423,6 +1451,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 g_app.filteredFiles = std::move(g_app.pendingSearchResults);
                 ListView_SetItemCountEx(g_app.listFiles, static_cast<int>(g_app.filteredFiles.size()), LVSICF_NOINVALIDATEALL);
                 InvalidateRect(g_app.listFiles, nullptr, FALSE);
+                if (g_app.filterLbl) {
+                    wchar_t fbuf[128];
+                    swprintf_s(fbuf, L"%s files  (%s)%s",
+                        FormatCount(g_app.filteredFiles.size()).c_str(),
+                        FormatBytes(g_app.pendingSearchTotalBytes).c_str(),
+                        g_app.filteredFiles.size() >= 200000 ? L"  [cap 200k]" : L"");
+                    SetWindowTextW(g_app.filterLbl, fbuf);
+                }
             }
             return 0;
         }
@@ -1524,9 +1560,42 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                 LayoutControls();
             } else if (id == IDC_CHK_SYSTEM) {
                 g_app.showSystemFiles = (SendMessageW(g_app.chkSystem, BM_GETCHECK, 0, 0) == BST_CHECKED);
-                g_app.treemap.SetHideSystem(!g_app.showSystemFiles);
-                RebuildFlatRows();
-                RebuildFileFilter();
+                ApplyVisibilityFilters();
+            } else if (id == IDC_BTN_FILTERS) {
+                HMENU menu = CreatePopupMenu();
+                AppendMenuW(menu, MF_STRING | (g_app.showSystemFiles ? MF_CHECKED : 0), IDM_FLT_SYSTEM, L"Show System Files");
+                AppendMenuW(menu, MF_STRING | (g_app.hideHiddenFiles ? MF_CHECKED : 0), IDM_FLT_HIDDEN, L"Hide Hidden Files");
+                AppendMenuW(menu, MF_STRING | (g_app.hideCloudFiles ? MF_CHECKED : 0), IDM_FLT_CLOUD, L"Hide Cloud-Only Placeholders");
+                AppendMenuW(menu, MF_STRING | (g_app.hideSmallInTree ? MF_CHECKED : 0), IDM_FLT_NOSMALL, L"Hide Small Items (< 1 MB in Tree)");
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING | (g_app.scanning.load() ? MF_GRAYED : 0), IDM_FLT_FULLRESCAN, L"Force Full Rescan (Bypass HyperCache)");
+
+                RECT br{};
+                GetWindowRect(g_app.btnFilters, &br);
+                UINT cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_LEFTALIGN | TPM_TOPALIGN, br.left, br.bottom, 0, hwnd, nullptr);
+                DestroyMenu(menu);
+                if (cmd == IDM_FLT_SYSTEM) {
+                    g_app.showSystemFiles = !g_app.showSystemFiles;
+                    ApplyVisibilityFilters();
+                } else if (cmd == IDM_FLT_HIDDEN) {
+                    g_app.hideHiddenFiles = !g_app.hideHiddenFiles;
+                    ApplyVisibilityFilters();
+                } else if (cmd == IDM_FLT_CLOUD) {
+                    g_app.hideCloudFiles = !g_app.hideCloudFiles;
+                    ApplyVisibilityFilters();
+                } else if (cmd == IDM_FLT_NOSMALL) {
+                    g_app.hideSmallInTree = !g_app.hideSmallInTree;
+                    ApplyVisibilityFilters();
+                } else if (cmd == IDM_FLT_FULLRESCAN && !g_app.scanning.load()) {
+                    if (g_app.useCustomFolder) {
+                        StartScan(false, 0, g_app.customFolder, true);
+                    } else {
+                        int sel = static_cast<int>(SendMessageW(g_app.driveCombo, CB_GETCURSEL, 0, 0));
+                        if (sel >= 0 && sel < static_cast<int>(g_app.drives.size())) {
+                            StartScan(true, g_app.drives[sel].letter, g_app.drives[sel].root, true);
+                        }
+                    }
+                }
             } else if (id == IDC_BTN_LANG) {
                 HMENU menu = CreatePopupMenu();
                 for (size_t i = 0; i < g_langs.size(); ++i) {
@@ -1548,11 +1617,14 @@ LRESULT CALLBACK MainWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             } else if (id == IDC_EDIT_SEARCH && code == EN_CHANGE) {
                 KillTimer(hwnd, 2);
                 SetTimer(hwnd, 2, 40, nullptr);
-            } else if (id == IDC_MINSIZE_CMB && code == CBN_SELCHANGE) {
+            } else if ((id == IDC_MINSIZE_CMB || id == IDC_CAT_CMB || id == IDC_AGE_CMB) && code == CBN_SELCHANGE) {
                 RebuildFileFilter();
             } else if (id == IDC_BTN_CLEAR) {
                 KillTimer(hwnd, 2);
                 SetWindowTextW(g_app.editSearch, L"");
+                SendMessageW(g_app.minSizeCombo, CB_SETCURSEL, 0, 0);
+                SendMessageW(g_app.catCombo, CB_SETCURSEL, 0, 0);
+                SendMessageW(g_app.ageCombo, CB_SETCURSEL, 0, 0);
                 RebuildFileFilter();
             } else if (id == IDC_BTN_TM_UP && g_app.tree) {
                 uint32_t p = g_app.tree->nodes[g_app.treemapRoot].parent;

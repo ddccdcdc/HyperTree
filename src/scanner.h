@@ -53,4 +53,5 @@ struct ScanResult {
     std::wstring error;
 };
 
-ScanResult ScanDriveOrFolder(const std::wstring& targetPath, bool isDrive, wchar_t driveLetter, ScanProgress& progress);
+ScanResult ScanDriveOrFolder(const std::wstring& targetPath, bool isDrive, wchar_t driveLetter, ScanProgress& progress, bool forceFull = false);
+void InvalidateStdHyperCache(wchar_t driveLetter);
